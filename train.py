@@ -85,6 +85,10 @@ def main():
             print(f"  embedding plot -> {p}")
         if run is not None:
             run.summary["best_cross_eer"] = best["val"]; run.finish()
+        if args.hf_repo:                          # push this model's artifacts to HF storage
+            from stepup.hf import push_model
+            push_model(args.hf_repo, name, ARTIFACTS, args.hf_token)
+            print(f"  pushed {name} artifacts -> https://huggingface.co/{args.hf_repo}")
         del net                                   # free the model + GPU memory before the next
         gc.collect()
         if torch.cuda.is_available():

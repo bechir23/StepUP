@@ -17,6 +17,12 @@ from stepup.eval import summarise
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="comparison plots from artifacts/")
+    ap.add_argument("--hf-repo", default=None, help="also push the comparison figures to this HF repo")
+    ap.add_argument("--hf-token", default=None)
+    args = ap.parse_args()
+
     models, eer, r1, acc_curves = [], [], [], {}
     for f in sorted(glob.glob(str(ARTIFACTS / "test_*.parquet"))):
         name = f.split("test_")[-1][:-8]
@@ -62,6 +68,12 @@ def main():
     print(f"wrote {ARTIFACTS/'compare_eer.png'} and {ARTIFACTS/'compare_accumulated.png'}")
     print(pd.DataFrame(dict(model=models, cross_eer=np.round(eer, 3),
                             cross_rank1=np.round(r1, 3))).to_string(index=False))
+    if args.hf_repo:
+        from stepup.hf import push_files
+        push_files(args.hf_repo, [ARTIFACTS / "compare_eer.png",
+                                  ARTIFACTS / "compare_accumulated.png",
+                                  ARTIFACTS / "model_leaderboard.parquet"], args.hf_token)
+        print(f"pushed comparison figures -> https://huggingface.co/{args.hf_repo}")
 
 
 if __name__ == "__main__":

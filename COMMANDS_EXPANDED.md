@@ -33,9 +33,11 @@ the default below. Use this to know what config a run used and how to correct it
 ## Per-model batch (`full_pk`, used when `--P/--K` are 0)
 | model | P | K | batch |
 |---|---|---|---|
-| gaitcnn, resnet2d, cnnlstm | 16 | 4 | **64** |
-| r2plus1d, r3d, swin3d, vit | 8 | 4 | **32** |
-Change per run with `--P N --K M` (overrides the table).
+| gaitcnn, resnet2d, cnnlstm | 128 | 4 | **512** |
+| r2plus1d, r3d, swin3d, vit | 64 | 4 | **256** |
+Change per run with `--P N --K M` (overrides the table). The heavy 3D/transformer nets at full
+resolution and batch 256 are memory-hungry — if one OOMs on the A100, lower its `--P` (e.g. 16)
+or `--sample3d 64,64,32`.
 
 ## What `python train.py --model all` does
 It **trains each of the 7 backbones once, with the defaults**: `loss=ce`, `mining=standard`,

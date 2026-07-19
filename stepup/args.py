@@ -45,6 +45,10 @@ def add_common_args(ap):
     w.add_argument("--wandb", default="disabled", choices=["online", "offline", "disabled"])
     w.add_argument("--wandb-project", default="stepup-footstep")
     w.add_argument("--wandb-entity", default=None)
+    w.add_argument("--hf-repo", default=None,
+                   help="push artifacts to this HF model repo (e.g. Bechir23/stepup-footstep) "
+                        "so heavy checkpoints live in HF storage, not on the disk")
+    w.add_argument("--hf-token", default=None, help="HF token (else HF_TOKEN env / cached login)")
 
     s = ap.add_argument_group("smoke / subset")
     s.add_argument("--limit-ids", type=int, default=0,

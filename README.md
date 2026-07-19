@@ -50,21 +50,23 @@ python train.py --model resnet2d --no-augment --P 32 --K 4 --epochs 50
 python train.py --model swin3d   --plot-embed         # + save embedding plot
 python train.py --model all      --wandb online       # log every epoch to wandb
 ```
-**Batch size**: each model has a default in the registry `full_pk` (2D=64, 3D/transformer=32);
-override with `--P N --K M` (batch = P*K). One epoch = a full pass unless `--steps-per-epoch`.
-`--mixstyle` applies to the video ResNets (r2plus1d/r3d).
+**Batch size**: each model has a default in the registry `full_pk` — the light 2D/recurrent
+nets take **P=128 (batch 512)**, the heavy 3D/transformer nets **P=64 (batch 256)**. Override
+with `--P N --K M`. One epoch = a full pass unless `--steps-per-epoch`. `--mixstyle` applies to
+the video ResNets (r2plus1d/r3d).
 
 ### What `--model all` does (and what it does NOT)
 `--model all` trains the **7 backbones once, each with the defaults**: `loss=ce`,
-`mining=standard`, `augment=on`, `mixstyle=off`, each model's own batch (`full_pk`: 2D=64,
-3D/transformer=32), `lr=1e-4`, `dropout=0.2`, `weight_decay=5e-4`, warmup+cosine, 100 epochs,
-early stop, FP32. It writes per-model artifacts and prints test + accumulated rank-1.
+`mining=standard`, `augment=on`, `mixstyle=off`, each model's own batch (`full_pk`: 2D=P128
+batch 512, 3D/transformer=P64 batch 256), `lr=1e-4`, `dropout=0.2`, `weight_decay=5e-4`,
+warmup+cosine, 100 epochs, early stop, FP32. It writes per-model artifacts and prints
+test + accumulated rank-1.
 
 It **does NOT sweep** augment/mining/mixstyle/loss — each of those is a **separate command**
 (only the named flag changes from the defaults). See `COMMANDS.md` (quick) and
 `COMMANDS_EXPANDED.md` (every default + how to correct a run). MixStyle is applied only to the
-models that support it (r2plus1d/r3d); the big 3D/transformer nets use a smaller batch than the
-light 2D nets. To run **every model at the same batch 64**, add `--P 16 --K 4`.
+models that support it (r2plus1d/r3d); the light 2D nets take a bigger batch than the heavy
+3D/transformer nets. Override any run with `--P N --K M`.
 
 Logging is **step-based** (`--log-every 0` = auto ~20 points/epoch, same density at any batch),
 so even a short run gives a dense training curve; val is logged per epoch.
@@ -75,6 +77,20 @@ python evaluate.py --model resnet2d --ckpt artifacts/resnet2d_best.pt --ks 1,3,5
 ```
 Prints per-cell rank-1/EER, the competition verification report, and **accumulated rank-1**
 over a walking pass (k=1,3,5,10 — the deployment metric that reaches high values at k=5–10).
+
+## Push heavy artifacts to Hugging Face
+Checkpoints are large; add `--hf-repo user/name` to push each model's artifacts (checkpoint +
+metrics + plots) to a private HF model repo (auto-created). Token from `--hf-token`, `HF_TOKEN`,
+or a cached `huggingface_hub` login.
+```bash
+python train.py --model all --hf-repo Bechir23/stepup-footstep
+python plots.py --hf-repo Bechir23/stepup-footstep      # also pushes the comparison figures
+```
+Read them back anywhere:
+```python
+from huggingface_hub import snapshot_download
+d = snapshot_download("Bechir23/stepup-footstep", repo_type="model", local_dir="hf_results")
+```
 
 ## Compare
 ```bash

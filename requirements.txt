@@ -7,6 +7,7 @@ pytorch-metric-learning>=2.0
 # Optional
 umap-learn      # nicer embedding projection for --plot-embed (falls back to sklearn t-SNE)
 wandb           # only if you use --wandb online/offline
+huggingface_hub # only if you use --hf-repo (preinstalled on Colab)
 
 # Preinstalled on Colab (listed for local/non-Colab installs; uncomment if missing):
 # torch>=2.1

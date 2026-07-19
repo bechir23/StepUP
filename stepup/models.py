@@ -231,21 +231,22 @@ def count_params(m):
 
 def registry(sample3d, data_t=T):
     """Build the model registry for a given 3D input size and 2D frame count.
-    full_pk is the per-model (P, K): 2D/recurrent = 64, 3D/transformer = 32 (edit to taste)."""
-    pk64, pk32 = (16, 4), (8, 4)
+    full_pk is the per-model (P, K): the light 2D/recurrent nets take a big batch
+    P=128 (512), the heavy 3D/transformer nets P=64 (256). Override per run with --P/--K."""
+    pk2d, pk3d = (128, 4), (64, 4)
     return {
-        "gaitcnn":  dict(fn=make_gaitcnn, kw=dict(in_frames=data_t), full_pk=pk64,
+        "gaitcnn":  dict(fn=make_gaitcnn, kw=dict(in_frames=data_t), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
-        "resnet2d": dict(fn=make_resnet2d, kw=dict(in_frames=data_t), full_pk=pk64,
+        "resnet2d": dict(fn=make_resnet2d, kw=dict(in_frames=data_t), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
-        "cnnlstm":  dict(fn=make_cnnlstm, kw=dict(n_frames=min(32, data_t)), full_pk=pk64,
+        "cnnlstm":  dict(fn=make_cnnlstm, kw=dict(n_frames=min(32, data_t)), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(n_frames=min(16, data_t))),
-        "r2plus1d": dict(fn=make_r2plus1d, kw=dict(resize=sample3d), full_pk=pk32,
+        "r2plus1d": dict(fn=make_r2plus1d, kw=dict(resize=sample3d), full_pk=pk3d,
                          smoke_pk=(2, 4), smoke_kw=dict(resize=(24, 32, 24))),
-        "r3d":      dict(fn=make_r3d, kw=dict(resize=sample3d), full_pk=pk32,
+        "r3d":      dict(fn=make_r3d, kw=dict(resize=sample3d), full_pk=pk3d,
                          smoke_pk=(2, 4), smoke_kw=dict(resize=(24, 32, 24))),
-        "swin3d":   dict(fn=make_swin3d, kw=dict(resize=sample3d), full_pk=pk32,
+        "swin3d":   dict(fn=make_swin3d, kw=dict(resize=sample3d), full_pk=pk3d,
                          smoke_pk=(2, 4), smoke_kw=dict(resize=(24, 32, 24))),
-        "vit":      dict(fn=make_vit, kw=dict(resize=sample3d), full_pk=pk32,
+        "vit":      dict(fn=make_vit, kw=dict(resize=sample3d), full_pk=pk3d,
                          smoke_pk=(2, 4), smoke_kw=dict(resize=(24, 32, 24))),
     }
