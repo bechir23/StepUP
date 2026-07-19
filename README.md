@@ -78,15 +78,20 @@ python evaluate.py --model resnet2d --ckpt artifacts/resnet2d_best.pt --ks 1,3,5
 Prints per-cell rank-1/EER, the competition verification report, and **accumulated rank-1**
 over a walking pass (k=1,3,5,10 — the deployment metric that reaches high values at k=5–10).
 
-## Push heavy artifacts to Hugging Face
-Checkpoints are large; add `--hf-repo user/name` to push each model's artifacts (checkpoint +
-metrics + plots) to a private HF model repo (auto-created). Token from `--hf-token`, `HF_TOKEN`,
-or a cached `huggingface_hub` login.
+## Push heavy artifacts to Hugging Face (keep the disk light)
+Checkpoints are large; `--hf-repo user/name` pushes each model's artifacts (checkpoint +
+metrics + plots) to a private HF model repo (auto-created). Add **`--hf-offload`** to delete the
+local `.pt` after pushing — the **models then live only on HF**, and the artifacts folder keeps
+just the small metrics/plots. Token from `--hf-token`, `HF_TOKEN`, or a cached login.
 ```bash
-python train.py --model all --hf-repo Bechir23/stepup-footstep
+python train.py --model all --hf-repo Bechir23/stepup-footstep --hf-offload
 python plots.py --hf-repo Bechir23/stepup-footstep      # also pushes the comparison figures
 ```
-Read them back anywhere:
+`evaluate.py` **auto-fetches** an offloaded checkpoint from HF when it's not local:
+```bash
+python evaluate.py --model r2plus1d --hf-repo Bechir23/stepup-footstep --ks 1,3,5,10
+```
+Or pull the whole repo to read offline:
 ```python
 from huggingface_hub import snapshot_download
 d = snapshot_download("Bechir23/stepup-footstep", repo_type="model", local_dir="hf_results")

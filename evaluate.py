@@ -27,10 +27,20 @@ def main():
     ap.add_argument("--ks", default="1,3,5,10", help="accumulation levels for rank-1")
     ap.add_argument("--split", default="test", choices=["val", "test"])
     ap.add_argument("--plot-embed", action="store_true")
+    ap.add_argument("--hf-repo", default=None, help="fetch the checkpoint from this HF repo if not local")
+    ap.add_argument("--hf-token", default=None)
     args = ap.parse_args()
 
     seed_everything()
+    import os
     ckpt = args.ckpt or str(ARTIFACTS / f"{args.model}_best.pt")
+    if not os.path.exists(ckpt):                 # checkpoint offloaded to HF? fetch it
+        if args.hf_repo:
+            from stepup.hf import fetch_file
+            ckpt = fetch_file(args.hf_repo, f"{args.model}_best.pt", args.hf_token)
+            print(f"fetched checkpoint from HF: {ckpt}")
+        else:
+            raise SystemExit(f"checkpoint not found: {ckpt}\nPass --hf-repo user/name to fetch it from HF.")
     ck = torch.load(ckpt, map_location=dev, weights_only=False)
     cfg = ck["cfg"]
     set_dropout(cfg.get("dropout", 0.0))

@@ -44,3 +44,9 @@ def pull(repo_id, dest, token=None):
     """Download the whole repo into `dest` to read checkpoints/results back."""
     from huggingface_hub import snapshot_download
     return snapshot_download(repo_id, local_dir=str(dest), token=_token(token), repo_type="model")
+
+
+def fetch_file(repo_id, filename, token=None):
+    """Download a single file (e.g. a checkpoint) from the HF repo; return its local path."""
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(repo_id, filename, token=_token(token), repo_type="model")

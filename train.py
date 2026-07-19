@@ -89,6 +89,11 @@ def main():
             from stepup.hf import push_model
             push_model(args.hf_repo, name, ARTIFACTS, args.hf_token)
             print(f"  pushed {name} artifacts -> https://huggingface.co/{args.hf_repo}")
+            if args.hf_offload:                   # keep the folder light: models live on HF only
+                ckpt = ARTIFACTS / f"{name}_best.pt"
+                if ckpt.exists():
+                    ckpt.unlink()
+                    print(f"  offloaded {ckpt.name} (removed local copy; on HF)")
         del net                                   # free the model + GPU memory before the next
         gc.collect()
         if torch.cuda.is_available():

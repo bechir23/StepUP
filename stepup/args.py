@@ -49,6 +49,9 @@ def add_common_args(ap):
                    help="push artifacts to this HF model repo (e.g. Bechir23/stepup-footstep) "
                         "so heavy checkpoints live in HF storage, not on the disk")
     w.add_argument("--hf-token", default=None, help="HF token (else HF_TOKEN env / cached login)")
+    w.add_argument("--hf-offload", action="store_true",
+                   help="after pushing to HF, delete the local .pt checkpoint (keep metrics/plots) "
+                        "so the artifacts folder stays light; evaluate.py refetches it from HF")
 
     s = ap.add_argument_group("smoke / subset")
     s.add_argument("--limit-ids", type=int, default=0,
