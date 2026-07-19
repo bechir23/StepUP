@@ -71,13 +71,20 @@ def get_split():
 
 
 def get_manifest(split_name, clean=None, split=None):
-    """One row per clean footstep for a split: identity, footwear, pass, side, cube row."""
+    """One row per clean footstep for a split: identity, footwear, pass, side, cube row.
+    Reuses the cached manifest_{split}.parquet if present (this is the exact order the packs
+    were built from, so the pack rows stay aligned) and only rebuilds it otherwise."""
+    cached = ARTIFACTS / f"manifest_{split_name}.parquet"
+    if cached.exists():
+        return pd.read_parquet(cached).reset_index(drop=True)
     clean = clean if clean is not None else get_metadata()[1]
     split = split if split is not None else get_split()
     pids = set(split[split_name])
     sub = clean[clean.ParticipantID.isin(pids) & clean.Speed.isin(SPEEDS)]
-    return sub[["ParticipantID", "Footwear", "Speed", "PassID",
-                "FootstepID", "Side", "row"]].reset_index(drop=True)
+    man = sub[["ParticipantID", "Footwear", "Speed", "PassID",
+               "FootstepID", "Side", "row"]].reset_index(drop=True)
+    man.to_parquet(cached, index=False)
+    return man
 
 
 # --------------------------------------------------------------------- preprocessing
@@ -218,18 +225,42 @@ def pack_path(split_name, res):
     return ARTIFACTS / f"pack_{split_name}_{_res_tag(res)}_u8.npy"
 
 
+def _matches(path, n, want):
+    """True if an existing pack file has the right length and resolution."""
+    if not path.exists():
+        return False
+    ex = np.load(path, mmap_mode="r")
+    ok = len(ex) == n and tuple(ex.shape[2:]) == tuple(want)
+    del ex
+    return ok
+
+
+def existing_pack_path(split_name, manifest, res):
+    """The pack file to read: the resolution-tagged name, or the legacy untagged
+    `pack_{split}_u8.npy` (from earlier runs) if it exists and matches the resolution."""
+    want = tuple(res or (T, H, W))
+    n = len(manifest)
+    tagged = pack_path(split_name, res)
+    if _matches(tagged, n, want):
+        return tagged
+    legacy = ARTIFACTS / f"pack_{split_name}_u8.npy"
+    if _matches(legacy, n, want):
+        return legacy
+    return tagged                                     # neither present -> build here
+
+
 def build_pack(split_name, manifest, res=None, mirror_right=True, overwrite=False, workers=4):
-    """Write every preprocessed footstep of a split into one uint8 array, once (resolution-tagged)."""
+    """Write every preprocessed footstep of a split into one uint8 array, once. Reuses an
+    existing pack (tagged or legacy-untagged) that matches, so packs built by the notebook are
+    not rebuilt."""
     import torch.nn.functional as F
     from tqdm.auto import tqdm
-    path = pack_path(split_name, res)
     want = tuple(res or (T, H, W))
-    if path.exists() and not overwrite:
-        ex = np.load(path, mmap_mode="r")
-        if len(ex) == len(manifest) and tuple(ex.shape[2:]) == want:
-            del ex
-            return path
-        del ex
+    if not overwrite:
+        found = existing_pack_path(split_name, manifest, res)
+        if found.exists():
+            return found
+    path = pack_path(split_name, res)
     m = manifest.reset_index(drop=True)
     mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.uint8, shape=(len(m), 1, *want))
     groups = list(m.groupby(["ParticipantID", "Footwear", "Speed"]))
@@ -257,7 +288,7 @@ class PackedData(Dataset, _AugMixin):
 
     def __init__(self, split_name, manifest, res=None, augment=False, device="cpu", rows=None):
         from .config import dev
-        path = pack_path(split_name, res)
+        path = existing_pack_path(split_name, manifest, res)   # tagged or legacy untagged pack
         self.device = device
         full = manifest.reset_index(drop=True)
         self.rows = np.arange(len(full)) if rows is None else np.asarray(rows, dtype=np.int64)

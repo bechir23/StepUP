@@ -29,24 +29,32 @@ def find_root():
         p = pathlib.Path(p)
         return (p / "Data").exists() or (p / "participant_metadata.csv").exists()
 
-    if COLAB:
+    # 1) explicit override
+    if os.environ.get("STEPUP_ROOT"):
+        return pathlib.Path(os.environ["STEPUP_ROOT"])
+    # 2) Google Drive, detected by the FILESYSTEM mount (/content/drive), not the google.colab
+    #    import -- a `!python` subprocess does not import google.colab, so COLAB is False there,
+    #    but the Drive mount is still visible. Mount it if we are the notebook kernel and it is
+    #    not there yet.
+    if COLAB and not pathlib.Path("/content/drive").exists():
         try:
             from google.colab import drive
             drive.mount("/content/drive")
         except Exception:
             pass
-        # Data/ and artifacts/ may sit directly under MyDrive, or in a Footsteps/StepUP folder
+    if pathlib.Path("/content/drive/MyDrive").exists():
         for p in ("/content/drive/MyDrive", "/content/drive/MyDrive/Footsteps",
-                  "/content/drive/MyDrive/StepUP", "/content/drive/MyDrive/stepup",
-                  "/content/Footsteps"):
+                  "/content/drive/MyDrive/StepUP", "/content/drive/MyDrive/stepup"):
             if _has_data(p):
                 return pathlib.Path(p)
-        return pathlib.Path("/content/drive/MyDrive")
+    # 3) search upward from this file (local checkouts that sit inside the data folder)
     here = pathlib.Path(__file__).resolve()
     for parent in [here.parent, *here.parents]:
         if _has_data(parent):
             return parent
-    return pathlib.Path.cwd()
+    # 4) last resort
+    return pathlib.Path("/content/drive/MyDrive") if pathlib.Path("/content/drive").exists() \
+        else pathlib.Path.cwd()
 
 
 ROOT = find_root()
