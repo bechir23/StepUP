@@ -54,6 +54,21 @@ python train.py --model all      --wandb online       # log every epoch to wandb
 override with `--P N --K M` (batch = P*K). One epoch = a full pass unless `--steps-per-epoch`.
 `--mixstyle` applies to the video ResNets (r2plus1d/r3d).
 
+### What `--model all` does (and what it does NOT)
+`--model all` trains the **7 backbones once, each with the defaults**: `loss=ce`,
+`mining=standard`, `augment=on`, `mixstyle=off`, each model's own batch (`full_pk`: 2D=64,
+3D/transformer=32), `lr=1e-4`, `dropout=0.2`, `weight_decay=5e-4`, warmup+cosine, 100 epochs,
+early stop, FP32. It writes per-model artifacts and prints test + accumulated rank-1.
+
+It **does NOT sweep** augment/mining/mixstyle/loss — each of those is a **separate command**
+(only the named flag changes from the defaults). See `COMMANDS.md` (quick) and
+`COMMANDS_EXPANDED.md` (every default + how to correct a run). MixStyle is applied only to the
+models that support it (r2plus1d/r3d); the big 3D/transformer nets use a smaller batch than the
+light 2D nets. To run **every model at the same batch 64**, add `--P 16 --K 4`.
+
+Logging is **step-based** (`--log-every 0` = auto ~20 points/epoch, same density at any batch),
+so even a short run gives a dense training curve; val is logged per epoch.
+
 ## Evaluate a checkpoint
 ```bash
 python evaluate.py --model resnet2d --ckpt artifacts/resnet2d_best.pt --ks 1,3,5,10 --plot-embed

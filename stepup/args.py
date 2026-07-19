@@ -16,6 +16,9 @@ def add_common_args(ap):
     g.add_argument("--dropout", type=float, default=0.2)
     g.add_argument("--embed-dim", type=int, default=128)
     g.add_argument("--workers", type=int, default=8, help="DataLoader workers (Colab has cores)")
+    g.add_argument("--log-every", type=int, default=0,
+                   help="log train loss every N steps; 0 = auto (~20 logs/epoch, so the curve has "
+                        "the SAME density for any batch size). val is logged per epoch")
     g.add_argument("--amp", action="store_true", help="mixed precision (default off = FP32)")
 
     d = ap.add_argument_group("data")
@@ -64,6 +67,7 @@ def apply_smoke(args):
     args.steps_per_epoch = args.steps_per_epoch or 6
     args.workers = 0
     args.val_monitor = 200
+    args.log_every = 2                               # tiny epochs -> log every 2 steps
     args.P, args.K = args.P or 2, args.K or 4        # keep user --P/--K if given
     if args.sample3d == "full":
         args.sample3d = "24,32,24"

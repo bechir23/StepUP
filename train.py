@@ -12,6 +12,7 @@ Outputs per model in artifacts/: {name}_best.pt, hist_{name}.parquet, test_{name
 verif_{name}.parquet, acc_{name}.parquet, embed_{name}.png (with --plot-embed).
 """
 import argparse
+import gc
 
 import pandas as pd
 import torch
@@ -84,7 +85,10 @@ def main():
             print(f"  embedding plot -> {p}")
         if run is not None:
             run.summary["best_cross_eer"] = best["val"]; run.finish()
-        del net
+        del net                                   # free the model + GPU memory before the next
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

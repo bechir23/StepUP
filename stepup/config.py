@@ -83,5 +83,5 @@ def build_cfg(args):
         dropout=args.dropout, weight_decay=args.weight_decay,
         loss=args.loss, arc_scale=args.arc_scale, mining=args.mining,
         patience=args.patience, steps_per_epoch=args.steps_per_epoch,
-        limit_ids=getattr(args, "limit_ids", 0),
+        limit_ids=getattr(args, "limit_ids", 0), log_every=getattr(args, "log_every", 100),
     )

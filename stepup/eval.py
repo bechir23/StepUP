@@ -116,24 +116,33 @@ def summarise(df):
 
 
 def plot_history(hist_df, title, out_path):
-    """Per-epoch curves: train losses (total/id/triplet), val cross-EER, val cross rank-1."""
+    """Step-based curves: train losses (total/id/triplet) logged every N steps -- a dense
+    curve even with few epochs -- and val cross-EER / rank-1 at each epoch's step."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    h = hist_df
-    fig, ax = plt.subplots(1, 3, figsize=(13, 3.6))
-    ax[0].plot(h.epoch, h.train_loss, label="total")
-    ax[0].plot(h.epoch, h.id_loss, label="id")
-    ax[0].plot(h.epoch, h.triplet_loss, label="triplet")
-    ax[0].set_title("loss"); ax[0].legend(fontsize=7)
+    h = hist_df.copy()
+    xcol = "step" if "step" in h else "epoch"
     if "cross_eer" in h:
-        ax[1].plot(h.epoch, h.cross_eer); ax[1].set_ylim(0, 0.6)
+        tr = h[h["cross_eer"].isna()]                 # dense step-granular train rows
+        ep = h[h["cross_eer"].notna()]                # per-epoch val rows
+        if len(tr) == 0:                              # e.g. epochs shorter than log_every
+            tr = h
+    else:
+        tr, ep = h, h
+    fig, ax = plt.subplots(1, 3, figsize=(13, 3.6))
+    ax[0].plot(tr[xcol], tr.train_loss, label="total")
+    ax[0].plot(tr[xcol], tr.id_loss, label="id")
+    ax[0].plot(tr[xcol], tr.triplet_loss, label="triplet")
+    ax[0].set_title("train loss"); ax[0].legend(fontsize=7)
+    if "cross_eer" in ep:
+        ax[1].plot(ep[xcol], ep.cross_eer, marker="o", ms=3); ax[1].set_ylim(0, 0.6)
     ax[1].set_title("val cross EER (lower=better)")
-    if "cross_rank1" in h:
-        ax[2].plot(h.epoch, h.cross_rank1); ax[2].set_ylim(0, 1)
+    if "cross_rank1" in ep:
+        ax[2].plot(ep[xcol], ep.cross_rank1, marker="o", ms=3); ax[2].set_ylim(0, 1)
     ax[2].set_title("val cross rank-1")
     for a in ax:
-        a.set_xlabel("epoch"); a.grid(alpha=.3)
+        a.set_xlabel(xcol); a.grid(alpha=.3)
     fig.suptitle(title); fig.tight_layout()
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)

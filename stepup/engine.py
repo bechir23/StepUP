@@ -55,8 +55,15 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
             for xb, yb, fwb in loader:
                 yield xb.to(dev, non_blocking=True), yb.to(dev), fwb.to(dev)
 
+    # 0 = auto: ~20 logs per epoch, so the step-based curve has the same density at any batch
+    log_every = cfg.get("log_every", 0) or max(1, steps_per_epoch // 20)
+    if wandb_run is not None:                                # step-based x-axis on wandb
+        wandb_run.define_metric("step")
+        wandb_run.define_metric("*", step_metric="step")
+
     best = dict(val=float("inf"), state=None, epoch=-1)
-    hist, bad = [], 0
+    hist, bad, gstep = [], 0, 0
+    win = dict(loss=[], id=[], tri=[])                       # window since the last step-log
     for epoch in range(max_epochs):
         net.train(); crit.train()
         ep_loss, ep_id, ep_tri = [], [], []
@@ -68,19 +75,29 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
                 f_t, f_i, _ = net(xb)
                 loss, l_id, l_tri = crit(f_t, f_i, yb, mine(f_t, yb, fwb))
             scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-            ep_loss.append(loss.item()); ep_id.append(l_id); ep_tri.append(l_tri)
-            steps.set_postfix(loss=f"{loss.item():.2f}")
+            gstep += 1
+            lv = loss.item()
+            ep_loss.append(lv); ep_id.append(l_id); ep_tri.append(l_tri)
+            win["loss"].append(lv); win["id"].append(l_id); win["tri"].append(l_tri)
+            steps.set_postfix(loss=f"{lv:.2f}", id=f"{l_id:.2f}", tri=f"{l_tri:.2f}")
+            if gstep % log_every == 0:                       # dense step-based train curve
+                r = dict(step=gstep, epoch=epoch, train_loss=float(np.mean(win["loss"])),
+                         id_loss=float(np.mean(win["id"])), triplet_loss=float(np.mean(win["tri"])))
+                hist.append(r)
+                if wandb_run is not None:
+                    wandb_run.log(r)
+                win = dict(loss=[], id=[], tri=[])
 
         lr = opt.param_groups[0]["lr"]; sched.step()
-        s = summarise(leave_one_footwear_out(net, ds_va))
+        s = summarise(leave_one_footwear_out(net, ds_va))    # val once per epoch
         val = s.get(monitor, float("inf"))
-        row = dict(epoch=epoch, train_loss=float(np.mean(ep_loss)), id_loss=float(np.mean(ep_id)),
-                   triplet_loss=float(np.mean(ep_tri)), lr=lr, **s)
-        hist.append(row)
+        er = dict(step=gstep, epoch=epoch, lr=lr, train_loss=float(np.mean(ep_loss)),
+                  id_loss=float(np.mean(ep_id)), triplet_loss=float(np.mean(ep_tri)), **s)
+        hist.append(er)
         if wandb_run is not None:
-            wandb_run.log(row)
-        print(f"{tag} ep {epoch + 1:>3}/{max_epochs}  loss {row['train_loss']:6.3f}  "
-              f"id {row['id_loss']:6.3f}  tri {row['triplet_loss']:5.3f}  lr {lr:.2e}  "
+            wandb_run.log({"step": gstep, "epoch": epoch, "lr": lr, **s})
+        print(f"{tag} ep {epoch + 1:>3}/{max_epochs} step {gstep}  loss {er['train_loss']:6.3f}  "
+              f"id {er['id_loss']:6.3f}  tri {er['triplet_loss']:5.3f}  lr {lr:.2e}  "
               f"val_eer {s.get('cross_eer', float('nan')):.3f}  "
               f"val_r1 {s.get('cross_rank1', float('nan')):.3f}", flush=True)
 
