@@ -38,7 +38,7 @@ def add_common_args(ap):
     d.set_defaults(augment=True, use_pack=True)
 
     l = ap.add_argument_group("loss / mining")
-    l.add_argument("--loss", default="arcface", choices=["arcface", "supcon", "ce"],
+    l.add_argument("--loss", default="arcface", choices=["arcface", "triplet", "supcon", "ce"],
                    help="ID loss. Default single-center ArcFace s=16 on the L2-normed embedding "
                         "(reference recipe, no triplet). 'supcon' = supervised contrastive (the "
                         "CodaBench baseline objective). 'ce' = label-smoothed CE + triplet "

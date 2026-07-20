@@ -279,7 +279,10 @@ def registry(sample3d, data_t=T):
     convs over 101x75x40 OOM even a 40GB A100. They are therefore fed a resized Kinetics-style
     clip (<=16 frames, <=64 spatial); the 2D nets still see the full-resolution cube."""
     pk2d, pk3d = (128, 4), (8, 4)
-    clip3d = (min(16, sample3d[0]), min(64, sample3d[1]), min(64, sample3d[2]))
+    # 3D nets resize to this clip. Cap at 48 frames / 64 spatial so the competition winner's exact
+    # (48,48,48) input (--sample3d 48,48,48) passes through unchanged; the full 101-frame cube is
+    # still downsampled (it OOMs 3D convs otherwise).
+    clip3d = (min(48, sample3d[0]), min(64, sample3d[1]), min(64, sample3d[2]))
     return {
         "gaitcnn":  dict(fn=make_gaitcnn, kw=dict(in_frames=data_t), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),

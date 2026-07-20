@@ -73,6 +73,10 @@ class Criterion(nn.Module):
             self._m_target = 0.5
             self.arc.set_margin(0.0)
             self.ce = nn.CrossEntropyLoss()
+        elif self.kind == "triplet":
+            # pure online-mined triplet loss on the pre-BN feature -- the loss the StepUP
+            # competition WINNER used (R(2+1)D + triplet + aug). Mining is handled in the engine.
+            self.triplet = losses.TripletMarginLoss(margin=cfg.get("triplet_margin", 0.3))
         elif self.kind == "supcon":
             # supervised contrastive (Khosla et al. 2020), the CodaBench StepUP baseline objective:
             # pulls same-identity embeddings together, pushes others apart, directly on the unit
@@ -93,6 +97,9 @@ class Criterion(nn.Module):
         if self.kind == "arcface":
             l_id = self.ce(self.arc(F.normalize(f_i), yb), yb)   # ArcFace on L2-normed embedding
             return l_id, l_id.item(), 0.0                         # no triplet (matches reference)
+        if self.kind == "triplet":
+            l = self.triplet(f_t, yb, mined)                      # pure triplet (competition winner)
+            return l, 0.0, l.item()
         if self.kind == "supcon":
             l = self.supcon(F.normalize(f_i), yb)                 # supervised contrastive
             return l, l.item(), 0.0
