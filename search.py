@@ -19,6 +19,7 @@ import random
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from stepup.args import add_common_args, apply_smoke
 from stepup.config import ARTIFACTS, T, build_cfg, dev, seed_everything
@@ -67,7 +68,9 @@ def main():
     minimise = args.rank_by.endswith("eer")
     results, best_so_far = [], (1.0 if minimise else 0.0)
 
-    for t in range(args.trials):
+    pbar = tqdm(range(args.trials), desc="search", unit="trial")
+    for t in pbar:
+        pbar.set_postfix(best=f"{best_so_far:.3f}", done=len(results))
         cfg = dict(base)
         pick = sample_config(rng, fixed)
         cfg.update(loss=pick["loss"], lr=float(pick["lr"]), dropout=float(pick["dropout"]),
@@ -100,9 +103,10 @@ def main():
                    unseen_fmr100=round(cond.get("unseen", {}).get("fmr100", float("nan")), 4))
         score = row["mixed5"] if args.rank_by == "mixed5" else row[args.rank_by]
         best_so_far = min(best_so_far, score) if minimise else max(best_so_far, score)
+        results.append(row)
+        pbar.set_postfix(best=f"{best_so_far:.3f}", last=f"{score:.3f}", done=len(results))
         print(f"  -> {args.rank_by}={score}  (best {best_so_far})  mixed5={row['mixed5']} "
               f"unseen_eer={row['unseen_eer']}", flush=True)
-        results.append(row)
         del net, fpre
         if dev == "cuda":
             torch.cuda.empty_cache()
