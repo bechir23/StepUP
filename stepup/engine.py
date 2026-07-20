@@ -64,7 +64,11 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         wandb_run.define_metric("step")
         wandb_run.define_metric("*", step_metric="step")
 
-    margin_warmup = max(1, round(cfg.get("margin_warmup_frac", 0.1) * max_epochs))
+    # fixed ~5-epoch angular-margin ramp (the reference schedule): starting the margin near 0
+    # keeps epoch-1 loss at the healthy CE floor ~ln(n_ids) and lets the embedding spread before
+    # the hard margin bites. A fraction-of-epochs ramp is too fast on short runs (margin already
+    # ~half-target at epoch 1), which inflates the early loss and hurts convergence.
+    margin_warmup = min(max_epochs, 5)
     best = dict(val=float("inf"), state=None, epoch=-1)
     hist, bad, gstep = [], 0, 0
     win = dict(loss=[], id=[], tri=[])                       # window since the last step-log

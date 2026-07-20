@@ -7,7 +7,10 @@ cross-footwear positive mining (the footwear-invariance contribution).
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pytorch_metric_learning import losses
+
+from .arcface import ArcFace
 
 
 def _stack(a, p, n, device):
@@ -62,23 +65,29 @@ class Criterion(nn.Module):
 
     def __init__(self, cfg, n_ids, embed_dim):
         super().__init__()
-        self.kind = cfg.get("loss", "ce")
+        self.kind = cfg.get("loss", "arcface")
         if self.kind == "arcface":
-            self.arc = losses.SubCenterArcFaceLoss(num_classes=n_ids, embedding_size=embed_dim,
-                                                   sub_centers=3, scale=cfg.get("arc_scale", 16))
-            self._m_target = float(self.arc.margin)     # ramp the angular margin 0 -> target
-            self.arc.margin = 0.0                        # (prevents early embedding collapse)
+            # single-center ArcFace on the L2-normalized embedding, no triplet -- the reference
+            # recipe, verified to beat SubCenter+triplet on clean identities. Margin ramps 0->m.
+            self.arc = ArcFace(embed_dim, n_ids, s=cfg.get("arc_scale", 16.0), m=0.5)
+            self._m_target = 0.5
+            self.arc.set_margin(0.0)
+            self.ce = nn.CrossEntropyLoss()
         else:
+            # BNNeck "bag of tricks": label-smoothed CE ID head + triplet (kept for the ce ablation)
             self.id_head = nn.Linear(embed_dim, n_ids)
             self.ce = nn.CrossEntropyLoss(label_smoothing=0.1)
-        self.triplet = losses.TripletMarginLoss(margin=0.3)
+            self.triplet = losses.TripletMarginLoss(margin=0.3)
 
     def set_margin_frac(self, frac):
-        """ArcFace only: set the angular margin to frac x target (called during warmup)."""
+        """ArcFace only: ramp the angular margin 0 -> target (called each epoch during warmup)."""
         if self.kind == "arcface":
-            self.arc.margin = self._m_target * max(0.0, min(1.0, frac))
+            self.arc.set_margin(self._m_target * max(0.0, min(1.0, frac)))
 
     def forward(self, f_t, f_i, yb, mined):
-        l_id = self.arc(f_i, yb) if self.kind == "arcface" else self.ce(self.id_head(f_i), yb)
+        if self.kind == "arcface":
+            l_id = self.ce(self.arc(F.normalize(f_i), yb), yb)   # ArcFace on L2-normed embedding
+            return l_id, l_id.item(), 0.0                         # no triplet (matches reference)
+        l_id = self.ce(self.id_head(f_i), yb)
         l_tri = self.triplet(f_t, yb, mined)
         return l_id + l_tri, l_id.item(), l_tri.item()
