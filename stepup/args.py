@@ -7,7 +7,9 @@ def add_common_args(ap):
                    help="identities per batch (batch = P*K); 0 = the model's own full_pk")
     g.add_argument("--K", type=int, default=0, help="steps per identity; 0 = the model's full_pk")
     g.add_argument("--epochs", type=int, default=100)
-    g.add_argument("--patience", type=int, default=10, help="early-stop patience (val cross EER)")
+    g.add_argument("--patience", type=int, default=10,
+                   help="early-stop patience: epochs with no improvement in the composite val "
+                        "fitness (not a single noisy metric). 0 = never early-stop (train all epochs).")
     g.add_argument("--steps-per-epoch", type=int, default=0,
                    help="0 = a full pass over the training footsteps at the model's batch")
     g.add_argument("--lr", type=float, default=1e-3,

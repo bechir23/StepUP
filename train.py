@@ -22,7 +22,7 @@ from stepup.config import ARTIFACTS, T, build_cfg, seed_everything
 from stepup.data import build_datasets
 from stepup.engine import train
 from stepup.eval import (accumulated_identification, condition_verification,
-                         cross_footwear_verification, leave_one_footwear_out,
+                         cross_footwear_verification, leave_one_footwear_out, open_set_accumulated,
                          plot_embeddings, plot_history, summarise)
 from stepup.models import registry, set_dropout
 from stepup.wb import init_run
@@ -64,7 +64,7 @@ def main():
                                 ds_tr=ds["train"], ds_va=ds["val_mon"], mining=cfg["mining"],
                                 wandb_run=run)
         torch.save(dict(state=best["state"], cfg=cfg, model=name, kw=spec["kw"],
-                        val_cross_eer=best["val"], epoch=best["epoch"]),
+                        val_fitness=best["val"], epoch=best["epoch"]),
                    ARTIFACTS / f"{name}_best.pt")
         hist.to_parquet(ARTIFACTS / f"hist_{name}.parquet", index=False)
         plot_history(hist, f"{name} training", ARTIFACTS / f"curves_{name}.png")
@@ -87,13 +87,17 @@ def main():
                 print(f"  {c:6s} EER {r['eer']*100:5.2f}  FMR100 {r['fmr100']*100:5.2f}  "
                       f"ACC {r['accuracy']*100:5.2f}  BACC {r['balanced_accuracy']*100:5.2f}  "
                       f"FNMR {r['fnmr']*100:5.2f}  FMR {r['fmr']*100:5.2f}")
-        print("  accumulated rank1  " + "  ".join(f"{k}-step {v:.3f}" for k, v in acc.items()))
+        print("  cross-footwear acc rank1 (hard)   " + "  ".join(f"{k}-step {v:.3f}"
+              for k, v in acc.items()))
+        mg = open_set_accumulated(net, ds["test"], ks=(1, 3, 5, 10), repeats=5, score_norm="znorm")
+        print("  mixed-gallery acc rank1 (=val)    " + "  ".join(f"{k}-step {v:.3f}"
+              for k, v in mg.items()))                            # same protocol as val_r1(mixed5)
         if args.plot_embed:
             p = plot_embeddings(net, ds["test"], f"{name} test embeddings",
                                 ARTIFACTS / f"embed_{name}.png")
             print(f"  embedding plot -> {p}")
         if run is not None:
-            run.summary["best_cross_eer"] = best["val"]; run.finish()
+            run.summary["best_fitness"] = best["val"]; run.finish()
         if args.hf_repo:                          # push this model's artifacts to HF storage
             from stepup.hf import push_model
             push_model(args.hf_repo, name, ARTIFACTS, args.hf_token)

@@ -30,7 +30,8 @@ from stepup.models import registry, set_dropout
 
 # ---------------------------------------------------------------- search space
 SPACE = {
-    "model":    ["r2plus1d", "gaitcnn", "resnet2d", "gaitcnn_deep"],
+    "model":    ["r2plus1d", "r2plus1d_light", "r3d", "r3d_light", "swin3d", "swin3d_light",
+                 "convnext", "resnet2d", "resnet2d_light", "gaitcnn", "gaitcnn_deep", "cnnlstm", "vit"],
     "loss":     ["arcface", "triplet"],
     "lr":       [1e-4, 2e-4, 5e-4, 1e-3],
     "dropout":  [0.2, 0.3, 0.4],
@@ -79,7 +80,7 @@ def main():
         name = pick["model"]
         data_t = cfg["pack_res"][0] if cfg["pack_res"] else T
         spec = registry(cfg["sample3d"], data_t)[name]
-        P, K = spec["full_pk"]
+        P, K = (args.P or spec["full_pk"][0]), (args.K or spec["full_pk"][1])
         steps = max(1, len(man["train"]) // (P * K))
         print(f"\n=== trial {t+1}/{args.trials}: {name} loss={pick['loss']} lr={pick['lr']} "
               f"dropout={pick['dropout']} sample3d={pick['sample3d']} ===", flush=True)
@@ -130,7 +131,7 @@ def main():
         name = best["model"]
         data_t = cfg["pack_res"][0] if cfg["pack_res"] else T
         spec = registry(cfg["sample3d"], data_t)[name]
-        P, K = spec["full_pk"]
+        P, K = (args.P or spec["full_pk"][0]), (args.K or spec["full_pk"][1])
         steps = max(1, len(man["train"]) // (P * K))
         print(f"\n=== FINAL: training best config to completion ({name}, loss={best['loss']}, "
               f"lr={best['lr']}, {args.final_epochs} epochs) ===", flush=True)

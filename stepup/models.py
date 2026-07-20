@@ -97,6 +97,17 @@ def make_resnet2d(embed_dim=128, n_classes=None, in_frames=T):
                     embed_dim=embed_dim, n_classes=n_classes)
 
 
+def make_resnet2d_light(embed_dim=128, n_classes=None, in_frames=T):
+    """Lighter ResNet-2D: ResNet-18 with the last (512-ch) stage dropped -> ~2.8M params, feat 256."""
+    net = resnet18(weights=None)
+    net.conv1 = nn.Conv2d(in_frames, 64, 3, stride=1, padding=1, bias=False)
+    net.maxpool = nn.Identity()
+    net.layer4 = nn.Identity()                       # drop the deepest stage; layer3 out = 256
+    net.fc = nn.Identity()
+    return Embedder(nn.Sequential(TimeAsChannels(), net), feat_dim=256,
+                    embed_dim=embed_dim, n_classes=n_classes)
+
+
 class GaitCNN(nn.Module):
     """Compact 2D-CNN for the 75x40 map (reference plantar-pressure shape): 4 gentle blocks."""
 
@@ -118,6 +129,19 @@ class GaitCNN(nn.Module):
 def make_gaitcnn(embed_dim=128, n_classes=None, in_frames=T):
     net = GaitCNN(in_frames=in_frames)
     return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
+
+
+def make_convnext(embed_dim=128, n_classes=None, in_frames=T):
+    """ConvNeXt-Tiny (2D, frames-as-channels) with a small-input stem (stride-2 patchify instead
+    of 4) so the 75x40 map isn't over-downsampled. One of the architectures the top teams explored;
+    ~28M params, modern conv design that often generalizes better than ResNet."""
+    from torchvision.models import convnext_tiny
+    net = convnext_tiny(weights=None)
+    old = net.features[0][0]                         # Conv2d(3, 96, k=4, s=4) patchify stem
+    net.features[0][0] = nn.Conv2d(in_frames, old.out_channels, kernel_size=4, stride=2, padding=1)
+    net.classifier[2] = nn.Identity()               # drop final Linear -> keep LayerNorm+Flatten=768
+    backbone = nn.Sequential(TimeAsChannels(), net.features, net.avgpool, net.classifier)
+    return Embedder(backbone, feat_dim=768, embed_dim=embed_dim, n_classes=n_classes)
 
 
 class ResBlock2d(nn.Module):
@@ -221,21 +245,45 @@ def make_r2plus1d(embed_dim=128, n_classes=None, resize=None, mixstyle=False):
     return _wrap3d(MixStyleVideo(net) if mixstyle else net, resize, embed_dim, n_classes, 512)
 
 
+def make_r2plus1d_light(embed_dim=128, n_classes=None, resize=None, mixstyle=False):
+    """Lighter R(2+1)D: drop the last (heaviest, 512-channel) residual stage -> ~14M params vs
+    31M, feature dim 256. Fewer blocks + fewer params memorize the train identities more slowly,
+    which is the direction that helps open-set transfer to unseen footwear (not more depth)."""
+    from torchvision.models.video import r2plus1d_18
+    net = _to_single_channel(r2plus1d_18(weights=None))
+    net.layer4 = nn.Identity()                       # remove the deepest stage; layer3 out = 256
+    return _wrap3d(MixStyleVideo(net) if mixstyle else net, resize, embed_dim, n_classes, 256)
+
+
 def make_r3d(embed_dim=128, n_classes=None, resize=None, mixstyle=False):
     from torchvision.models.video import r3d_18
     net = _to_single_channel(r3d_18(weights=None))
     return _wrap3d(MixStyleVideo(net) if mixstyle else net, resize, embed_dim, n_classes, 512)
 
 
-def make_swin3d(embed_dim=128, n_classes=None, resize=None):
+def make_r3d_light(embed_dim=128, n_classes=None, resize=None, mixstyle=False):
+    """Lighter R3D: drop the last 512-channel stage -> ~14M params, feature dim 256."""
+    from torchvision.models.video import r3d_18
+    net = _to_single_channel(r3d_18(weights=None))
+    net.layer4 = nn.Identity()
+    return _wrap3d(MixStyleVideo(net) if mixstyle else net, resize, embed_dim, n_classes, 256)
+
+
+def make_swin3d(embed_dim=128, n_classes=None, resize=None, depths=(2, 2, 6, 2), feat_dim=768):
     """Video Swin re-parameterised for the small map: patch (2,2,2), window (8,4,4)."""
     from torchvision.models.video.swin_transformer import SwinTransformer3d
-    net = SwinTransformer3d(patch_size=[2, 2, 2], embed_dim=96, depths=[2, 2, 6, 2],
-                            num_heads=[3, 6, 12, 24], window_size=[8, 4, 4], num_classes=1)
+    heads = [3, 6, 12, 24][:len(depths)]
+    net = SwinTransformer3d(patch_size=[2, 2, 2], embed_dim=96, depths=list(depths),
+                            num_heads=heads, window_size=[8, 4, 4], num_classes=1)
     pe = net.patch_embed.proj
     net.patch_embed.proj = nn.Conv3d(1, pe.out_channels, pe.kernel_size, pe.stride, pe.padding)
     net.head = nn.Identity()
-    return _wrap3d(net, resize, embed_dim, n_classes, feat_dim=768)
+    return _wrap3d(net, resize, embed_dim, n_classes, feat_dim=feat_dim)
+
+
+def make_swin3d_light(embed_dim=128, n_classes=None, resize=None):
+    """Lighter video Swin: 3 stages with a shallow [2,2,2] depth instead of [2,2,6,2]."""
+    return make_swin3d(embed_dim, n_classes, resize, depths=(2, 2, 2), feat_dim=384)
 
 
 class VideoViT(nn.Module):
@@ -288,16 +336,26 @@ def registry(sample3d, data_t=T):
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "gaitcnn_deep": dict(fn=make_gaitcnn_deep, kw=dict(in_frames=data_t), full_pk=pk2d,
                              smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "convnext": dict(fn=make_convnext, kw=dict(in_frames=data_t), full_pk=(64, 4),
+                         smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "resnet2d": dict(fn=make_resnet2d, kw=dict(in_frames=data_t), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "resnet2d_light": dict(fn=make_resnet2d_light, kw=dict(in_frames=data_t), full_pk=pk2d,
+                              smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "cnnlstm":  dict(fn=make_cnnlstm, kw=dict(n_frames=min(32, data_t)), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(n_frames=min(16, data_t))),
         "r2plus1d": dict(fn=make_r2plus1d, kw=dict(resize=clip3d), full_pk=pk3d,
                          smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
+        "r2plus1d_light": dict(fn=make_r2plus1d_light, kw=dict(resize=clip3d), full_pk=pk3d,
+                              smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
         "r3d":      dict(fn=make_r3d, kw=dict(resize=clip3d), full_pk=pk3d,
+                         smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
+        "r3d_light": dict(fn=make_r3d_light, kw=dict(resize=clip3d), full_pk=pk3d,
                          smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
         "swin3d":   dict(fn=make_swin3d, kw=dict(resize=clip3d), full_pk=pk3d,
                          smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
+        "swin3d_light": dict(fn=make_swin3d_light, kw=dict(resize=clip3d), full_pk=pk3d,
+                            smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
         "vit":      dict(fn=make_vit, kw=dict(resize=clip3d), full_pk=pk3d,
                          smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
     }

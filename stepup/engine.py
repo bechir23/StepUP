@@ -117,7 +117,8 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     # the hard margin bites. A fraction-of-epochs ramp is too fast on short runs (margin already
     # ~half-target at epoch 1), which inflates the early loss and hurts convergence.
     margin_warmup = min(max_epochs, 5)
-    best = dict(val=float("inf"), state=None, epoch=-1)
+    patience = patience if patience and patience > 0 else float("inf")   # YOLO: 0 -> train all epochs
+    best = dict(val=-float("inf"), state=None, epoch=-1)   # maximise the composite fitness
     hist, bad, gstep = [], 0, 0
     win = dict(loss=[], id=[], tri=[])                       # window since the last step-log
     for epoch in range(max_epochs):
@@ -165,7 +166,13 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         import gc; gc.collect()                              # reclaim RAM between epochs (low-RAM cards)
         if dev == "cuda":
             torch.cuda.empty_cache()
-        val = s.get(monitor, float("inf"))                  # early-stop on cross_eer (invariance)
+        # Composite validation FITNESS (higher = better), the YOLO idea: don't early-stop on one
+        # noisy metric (cross_eer plateaus early while the model still improves elsewhere). Weight
+        # the generalization signals that matter -- rank-1, unseen-footwear EER, cross-footwear EER.
+        fitness = (0.40 * mixed5
+                   + 0.35 * (1 - s.get("unseen_eer", 0.5))   # unseen footwear -- the hard target
+                   + 0.25 * (1 - s.get("cross_eer", 0.5)))   # cross-footwear invariance
+        s["fitness"] = fitness
         er = dict(step=gstep, epoch=epoch, lr=lr, train_loss=float(np.mean(ep_loss)),
                   id_loss=float(np.mean(ep_id)), triplet_loss=float(np.mean(ep_tri)), **s)
         hist.append(er)
@@ -177,10 +184,10 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
               f"val_r1(cross) {s.get('cross_rank1', float('nan')):.3f}  "
               f"val_r1(mixed5) {mixed5:.3f}  "
               f"EER(seen/unseen) {s.get('seen_eer', float('nan'))*100:.1f}/"
-              f"{s.get('unseen_eer', float('nan'))*100:.1f}", flush=True)
+              f"{s.get('unseen_eer', float('nan'))*100:.1f}  fit {fitness:.3f}", flush=True)
 
-        if val < best["val"] - 1e-4:
-            best.update(val=val, epoch=epoch,                # save the EMA weights (what we eval)
+        if fitness > best["val"] + 1e-4:                     # maximise fitness (was: minimise eer)
+            best.update(val=fitness, epoch=epoch,            # save the EMA weights (what we eval)
                         state={k: v.detach().cpu().clone() for k, v in ema.ema.state_dict().items()})
             bad = 0
         else:
