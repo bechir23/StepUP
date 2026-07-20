@@ -21,6 +21,8 @@ def main():
     ap = argparse.ArgumentParser(description="comparison plots from artifacts/")
     ap.add_argument("--hf-repo", default=None, help="also push the comparison figures to this HF repo")
     ap.add_argument("--hf-token", default=None)
+    ap.add_argument("--hf-offload", action="store_true",
+                    help="ignored here; accepted so the same flag set works across commands")
     args = ap.parse_args()
 
     models, eer, r1, acc_curves = [], [], [], {}

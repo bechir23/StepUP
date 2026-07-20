@@ -10,9 +10,14 @@ def add_common_args(ap):
     g.add_argument("--patience", type=int, default=10, help="early-stop patience (val cross EER)")
     g.add_argument("--steps-per-epoch", type=int, default=0,
                    help="0 = a full pass over the training footsteps at the model's batch")
-    g.add_argument("--lr", type=float, default=1e-4)
-    g.add_argument("--warmup-frac", type=float, default=0.1)
-    g.add_argument("--weight-decay", type=float, default=5e-4)
+    g.add_argument("--lr", type=float, default=1e-3,
+                   help="AdamW LR (reference-tuned 1e-3; raise for very large batches)")
+    g.add_argument("--warmup-frac", type=float, default=0.05,
+                   help="linear LR warmup fraction of epochs (short; reference ~3 epochs)")
+    g.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay (strong reg)")
+    g.add_argument("--margin-warmup-frac", type=float, default=0.1,
+                   help="ArcFace only: ramp the angular margin 0->target over this fraction of "
+                        "epochs (prevents early embedding collapse)")
     g.add_argument("--dropout", type=float, default=0.2)
     g.add_argument("--embed-dim", type=int, default=128)
     g.add_argument("--workers", type=int, default=8, help="DataLoader workers (Colab has cores)")
@@ -33,9 +38,13 @@ def add_common_args(ap):
     d.set_defaults(augment=True, use_pack=True)
 
     l = ap.add_argument_group("loss / mining")
-    l.add_argument("--loss", default="ce", choices=["ce", "arcface"],
-                   help="ID loss: label-smoothed CE (starts ~5) or SubCenter-ArcFace")
-    l.add_argument("--arc-scale", type=float, default=32.0, help="ArcFace scale s (if --loss arcface)")
+    l.add_argument("--loss", default="arcface", choices=["arcface", "ce"],
+                   help="ID loss. Default SubCenter-ArcFace s=16 (the reference recipe: angular "
+                        "margin -> tight open-set clusters that transfer to unseen ids). CE is "
+                        "kept for ablation only -- it caps open-set rank-1 ~0.5 (verified), so it "
+                        "is NOT the default.")
+    l.add_argument("--arc-scale", type=float, default=16.0,
+                   help="ArcFace scale s (reference uses 16; lower = gentler)")
     l.add_argument("--mining", default="standard", choices=["standard", "crossfw"],
                    help="triplet mining: batch-hard or cross-footwear positive")
     l.add_argument("--mixstyle", action="store_true",

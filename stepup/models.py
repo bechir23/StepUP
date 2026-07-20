@@ -148,14 +148,13 @@ def make_cnnlstm(embed_dim=128, n_classes=None, n_frames=32, lstm_dim=256):
 
 # --------------------------------------------------------------------- 3D (torchvision, corrected)
 def _to_single_channel(net):
-    """Adapt a torchvision video ResNet to the 1-channel 75x40 input: 1-ch stem with spatial
-    stride 1 (temporal kept), last_stride=1 on layer4. Lifts the final map ~5x3 -> ~19x10."""
+    """Adapt a torchvision video ResNet to 1-channel input: swap the stem's first conv to one
+    input channel and keep the network's standard spatiotemporal downsampling. The 3D nets are
+    fed a resized ~16-frame Kinetics-style clip (see registry), so the original strides are
+    correct and no stride surgery is needed -- the stride-1 surgery on a 101-frame full cube is
+    exactly what OOMs a 40GB GPU (a single conv3d activation reaches ~18GB)."""
     s0 = net.stem[0]
-    net.stem[0] = nn.Conv3d(1, s0.out_channels, s0.kernel_size,
-                            (s0.stride[0], 1, 1), s0.padding, bias=False)
-    for m in net.layer4.modules():
-        if isinstance(m, nn.Conv3d) and tuple(m.stride[1:]) == (2, 2):
-            m.stride = (m.stride[0], 1, 1)
+    net.stem[0] = nn.Conv3d(1, s0.out_channels, s0.kernel_size, s0.stride, s0.padding, bias=False)
     net.fc = nn.Identity()
     return net
 
@@ -201,7 +200,7 @@ def make_swin3d(embed_dim=128, n_classes=None, resize=None):
 class VideoViT(nn.Module):
     """Tubelet ViViT/VideoMAE encoder from scratch; patch sized to tile the small grid."""
 
-    def __init__(self, in_ch=1, dim=512, depth=8, heads=8, patch=(13, 5, 5), input_size=(T, H, W)):
+    def __init__(self, in_ch=1, dim=512, depth=8, heads=8, patch=(4, 8, 8), input_size=(T, H, W)):
         super().__init__()
         self.patch_embed = nn.Conv3d(in_ch, dim, patch, patch)
         with torch.no_grad():
@@ -231,9 +230,15 @@ def count_params(m):
 
 def registry(sample3d, data_t=T):
     """Build the model registry for a given 3D input size and 2D frame count.
-    full_pk is the per-model (P, K): the light 2D/recurrent nets take a big batch
-    P=128 (512), the heavy 3D/transformer nets P=64 (256). Override per run with --P/--K."""
-    pk2d, pk3d = (128, 4), (64, 4)
+    full_pk is the per-model (P, K): the light 2D/recurrent nets take a big batch P=128 (512),
+    the 3D/transformer nets a smaller P=8 (32). Override per run with --P/--K.
+
+    3D video nets cannot consume the full 101-frame cube -- R(2+1)D/R3D were designed for short
+    ~16-frame clips (Tran et al. 2018, "A Closer Look at Spatiotemporal Convolutions"), and 3D
+    convs over 101x75x40 OOM even a 40GB A100. They are therefore fed a resized Kinetics-style
+    clip (<=16 frames, <=64 spatial); the 2D nets still see the full-resolution cube."""
+    pk2d, pk3d = (128, 4), (8, 4)
+    clip3d = (min(16, sample3d[0]), min(64, sample3d[1]), min(64, sample3d[2]))
     return {
         "gaitcnn":  dict(fn=make_gaitcnn, kw=dict(in_frames=data_t), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
@@ -241,12 +246,12 @@ def registry(sample3d, data_t=T):
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "cnnlstm":  dict(fn=make_cnnlstm, kw=dict(n_frames=min(32, data_t)), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(n_frames=min(16, data_t))),
-        "r2plus1d": dict(fn=make_r2plus1d, kw=dict(resize=sample3d), full_pk=pk3d,
-                         smoke_pk=(2, 4), smoke_kw=dict(resize=(24, 32, 24))),
-        "r3d":      dict(fn=make_r3d, kw=dict(resize=sample3d), full_pk=pk3d,
-                         smoke_pk=(2, 4), smoke_kw=dict(resize=(24, 32, 24))),
-        "swin3d":   dict(fn=make_swin3d, kw=dict(resize=sample3d), full_pk=pk3d,
-                         smoke_pk=(2, 4), smoke_kw=dict(resize=(24, 32, 24))),
-        "vit":      dict(fn=make_vit, kw=dict(resize=sample3d), full_pk=pk3d,
-                         smoke_pk=(2, 4), smoke_kw=dict(resize=(24, 32, 24))),
+        "r2plus1d": dict(fn=make_r2plus1d, kw=dict(resize=clip3d), full_pk=pk3d,
+                         smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
+        "r3d":      dict(fn=make_r3d, kw=dict(resize=clip3d), full_pk=pk3d,
+                         smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
+        "swin3d":   dict(fn=make_swin3d, kw=dict(resize=clip3d), full_pk=pk3d,
+                         smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
+        "vit":      dict(fn=make_vit, kw=dict(resize=clip3d), full_pk=pk3d,
+                         smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
     }

@@ -7,7 +7,7 @@ from tqdm.auto import tqdm
 
 from .config import SEED, dev, seed_everything
 from .data import FootstepData, FootwearSpanningSampler, PKSampler
-from .eval import leave_one_footwear_out, summarise
+from .eval import (embed_dataset, leave_one_footwear_out, open_set_accumulated, summarise)
 from .losses import MINERS, Criterion
 
 
@@ -24,8 +24,11 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     crit = Criterion(cfg, n_ids, cfg["embed_dim"]).to(dev)
     mine = MINERS[mining]
     make_sampler = FootwearSpanningSampler if mining == "crossfw" else PKSampler
+    # scale the LR to our batch (sqrt rule, suited to AdamW): cfg["lr"] is tuned for batch 128,
+    # our 2D batch is 512 and 3D 256, so a bigger batch gets a proportionally bigger LR.
+    eff_lr = cfg["lr"] * (P * K / 128) ** 0.5
     opt = torch.optim.AdamW(list(net.parameters()) + list(crit.parameters()),
-                            lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 5e-4))
+                            lr=eff_lr, weight_decay=cfg.get("weight_decay", 5e-4))
     warmup = max(1, round(cfg.get("warmup_frac", 0.1) * max_epochs))
     sched = torch.optim.lr_scheduler.SequentialLR(
         opt, milestones=[warmup],
@@ -61,10 +64,12 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         wandb_run.define_metric("step")
         wandb_run.define_metric("*", step_metric="step")
 
+    margin_warmup = max(1, round(cfg.get("margin_warmup_frac", 0.1) * max_epochs))
     best = dict(val=float("inf"), state=None, epoch=-1)
     hist, bad, gstep = [], 0, 0
     win = dict(loss=[], id=[], tri=[])                       # window since the last step-log
     for epoch in range(max_epochs):
+        crit.set_margin_frac((epoch + 1) / margin_warmup)   # ArcFace margin ramp (no-op for CE)
         net.train(); crit.train()
         ep_loss, ep_id, ep_tri = [], [], []
         steps = tqdm(epoch_batches(), total=steps_per_epoch, leave=False,
@@ -89,8 +94,11 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
                 win = dict(loss=[], id=[], tri=[])
 
         lr = opt.param_groups[0]["lr"]; sched.step()
-        s = summarise(leave_one_footwear_out(net, ds_va))    # val once per epoch
-        val = s.get(monitor, float("inf"))
+        fyf = embed_dataset(net, ds_va)                      # embed val once, reuse for both
+        s = summarise(leave_one_footwear_out(net, ds_va, precomp=fyf))   # cross-footwear (hard)
+        mixed5 = open_set_accumulated(net, ds_va, ks=(5,), repeats=1, precomp=fyf).get(5, float("nan"))
+        s["mixed_r5"] = mixed5                               # reference-protocol 5-step rank-1
+        val = s.get(monitor, float("inf"))                  # early-stop on cross_eer (invariance)
         er = dict(step=gstep, epoch=epoch, lr=lr, train_loss=float(np.mean(ep_loss)),
                   id_loss=float(np.mean(ep_id)), triplet_loss=float(np.mean(ep_tri)), **s)
         hist.append(er)
@@ -99,7 +107,8 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         print(f"{tag} ep {epoch + 1:>3}/{max_epochs} step {gstep}  loss {er['train_loss']:6.3f}  "
               f"id {er['id_loss']:6.3f}  tri {er['triplet_loss']:5.3f}  lr {lr:.2e}  "
               f"val_eer {s.get('cross_eer', float('nan')):.3f}  "
-              f"val_r1 {s.get('cross_rank1', float('nan')):.3f}", flush=True)
+              f"val_r1(cross) {s.get('cross_rank1', float('nan')):.3f}  "
+              f"val_r1(mixed5) {mixed5:.3f}", flush=True)
 
         if val < best["val"] - 1e-4:
             best.update(val=val, epoch=epoch,

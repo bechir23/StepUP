@@ -65,13 +65,20 @@ class Criterion(nn.Module):
         self.kind = cfg.get("loss", "ce")
         if self.kind == "arcface":
             self.arc = losses.SubCenterArcFaceLoss(num_classes=n_ids, embedding_size=embed_dim,
-                                                   sub_centers=3, scale=cfg.get("arc_scale", 32))
+                                                   sub_centers=3, scale=cfg.get("arc_scale", 16))
+            self._m_target = float(self.arc.margin)     # ramp the angular margin 0 -> target
+            self.arc.margin = 0.0                        # (prevents early embedding collapse)
         else:
             self.id_head = nn.Linear(embed_dim, n_ids)
             self.ce = nn.CrossEntropyLoss(label_smoothing=0.1)
         self.triplet = losses.TripletMarginLoss(margin=0.3)
 
+    def set_margin_frac(self, frac):
+        """ArcFace only: set the angular margin to frac x target (called during warmup)."""
+        if self.kind == "arcface":
+            self.arc.margin = self._m_target * max(0.0, min(1.0, frac))
+
     def forward(self, f_t, f_i, yb, mined):
         l_id = self.arc(f_i, yb) if self.kind == "arcface" else self.ce(self.id_head(f_i), yb)
         l_tri = self.triplet(f_t, yb, mined)
-        return l_id + l_tri, float(l_id), float(l_tri)
+        return l_id + l_tri, l_id.item(), l_tri.item()

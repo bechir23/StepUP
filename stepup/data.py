@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, Sampler
-from torchvision.transforms.functional import rotate as tv_rotate
+from torchvision.transforms.functional import affine as tv_affine
 
 from .config import (ARTIFACTS, COLAB, DATA, FW2CODE, FOOTWEAR, ROOT, SEED, SPEEDS,
                      T, H, W, seed_everything)
@@ -115,8 +115,12 @@ class _AugMixin:
             x = x * (torch.rand(x.shape[-2:], device=x.device) > 0.05).float()
         if torch.rand(1).item() < 0.5:
             x = torch.flip(x, dims=[-2])
-        if torch.rand(1).item() < 0.5:
-            x = tv_rotate(x, float(torch.empty(1).uniform_(-15, 15)))
+        if torch.rand(1).item() < 0.5:              # rotation + footprint scale + small shift
+            angle = float(torch.empty(1).uniform_(-15, 15))
+            scale = float(torch.empty(1).uniform_(0.8, 1.25))   # contact-area robustness (ref)
+            tx = int(torch.randint(-3, 4, (1,)))
+            ty = int(torch.randint(-3, 4, (1,)))
+            x = tv_affine(x, angle=angle, translate=[tx, ty], scale=scale, shear=[0.0])
         if torch.rand(1).item() < 0.5:
             peak = x.max()
             if peak > 0:

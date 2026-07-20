@@ -105,6 +105,46 @@ def accumulated_identification(net, ds, ks=(1, 3, 5, 10)):
     return {k: float(np.nanmean(v)) for k, v in per_k.items()}
 
 
+def open_set_accumulated(net, ds, n_enroll=5, ks=(1, 3, 5, 10), repeats=3, precomp=None):
+    """Reference open-set protocol (mixed-footwear gallery, NOT cross-footwear): enroll
+    n_enroll random steps per identity (any footwear) into one template, then probe = running
+    mean of k consecutive steps within one (identity, footwear, speed) trial; rank-1 per k,
+    averaged over random enroll draws. This mirrors the reference eval that reaches ~0.9 at
+    k=5-10, so it is the fair comparison to that number -- contrast with
+    accumulated_identification, which is strict leave-one-footwear-out (much harder)."""
+    f, y, fw = precomp if precomp is not None else embed_dataset(net, ds)
+    f = F.normalize(f)
+    y = y.numpy() if hasattr(y, "numpy") else np.asarray(y)
+    m = ds.m.reset_index(drop=True)
+    speed = m.Speed.to_numpy() if "Speed" in m else np.zeros(len(m), int)
+    passid = m.PassID.to_numpy(); stepid = m.FootstepID.to_numpy(); fwc = np.asarray(fw)
+    ids = np.unique(y)
+    per_k = {k: [] for k in ks}
+    for seed in range(repeats):
+        rng = np.random.default_rng(seed)
+        templates, tids, enrolled = [], [], np.zeros(len(y), bool)
+        for i in ids:
+            idx = np.where(y == i)[0]; rng.shuffle(idx)
+            enrolled[idx[:n_enroll]] = True                    # mixed-footwear enroll steps
+            templates.append(F.normalize(f[idx[:n_enroll]].mean(0), dim=0)); tids.append(i)
+        templ = torch.stack(templates); tids = np.array(tids)
+        passes = {}
+        for j in range(len(y)):
+            if not enrolled[j]:
+                passes.setdefault((y[j], fwc[j], speed[j]), []).append(j)
+        for k in ks:
+            hit = tot = 0
+            for _, rows in passes.items():
+                rows = sorted(rows, key=lambda r: (passid[r], stepid[r]))
+                for s in range(0, len(rows) - k + 1, k):
+                    win = rows[s:s + k]
+                    probe = F.normalize(f[win].mean(0), dim=0)
+                    pred = tids[(probe @ templ.t()).argmax()]
+                    hit += int(pred == y[win[0]]); tot += 1
+            per_k[k].append(hit / tot if tot else float("nan"))
+    return {k: float(np.nanmean(v)) for k, v in per_k.items()}
+
+
 def summarise(df):
     out = {}
     for kind in ("same", "cross"):

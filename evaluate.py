@@ -15,7 +15,7 @@ import torch
 from stepup.config import ARTIFACTS, T, dev, seed_everything
 from stepup.data import build_datasets
 from stepup.eval import (accumulated_identification, cross_footwear_verification,
-                         leave_one_footwear_out, plot_embeddings, summarise)
+                         leave_one_footwear_out, open_set_accumulated, plot_embeddings, summarise)
 from stepup.models import registry, set_dropout
 
 
@@ -65,7 +65,11 @@ def main():
           f"FMR {vr['fmr']:.3f}  FNMR {vr['fnmr']:.3f}")
     ks = tuple(int(v) for v in args.ks.split(","))
     acc = accumulated_identification(net, target, ks=ks)
-    print("accumulated rank1  " + "  ".join(f"{k}-step {v:.3f}" for k, v in acc.items()))
+    print("accumulated rank1 (cross-footwear, hard)      " +
+          "  ".join(f"{k}-step {v:.3f}" for k, v in acc.items()))
+    osa = open_set_accumulated(net, target, ks=ks)
+    print("accumulated rank1 (mixed gallery, ref ~0.9)   " +
+          "  ".join(f"{k}-step {v:.3f}" for k, v in osa.items()))
     ev.to_parquet(ARTIFACTS / f"eval_{args.model}_{args.split}.parquet", index=False)
     if args.plot_embed:
         p = plot_embeddings(net, target, f"{args.model} {args.split} embeddings",
