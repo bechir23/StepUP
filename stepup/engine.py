@@ -1,4 +1,7 @@
 """Training loop: BNNeck ID+triplet loss, PK sampling, warmup+cosine, early stop on cross EER."""
+import copy
+import math
+
 import numpy as np
 import pandas as pd
 import torch
@@ -12,6 +15,29 @@ from .eval import (condition_verification, embed_dataset, leave_one_footwear_out
 from .losses import MINERS, Criterion
 
 
+class ModelEMA:
+    """Exponential moving average of the model weights (ultralytics/YOLO). A shadow copy is nudged
+    toward the live weights every optimizer step; evaluating on it is smoother and generalizes
+    better -- it damps the late-training memorization that makes the raw model's val decline. This
+    is the main training-loop difference vs a plain loop and usually the single biggest val gain."""
+
+    def __init__(self, model, decay=0.9999, tau=2000):
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+        self.updates = 0
+        self.decay = lambda x: decay * (1 - math.exp(-x / tau))   # ramps 0 -> decay early on
+
+    @torch.no_grad()
+    def update(self, model):
+        self.updates += 1
+        d = self.decay(self.updates)
+        msd = model.state_dict()
+        for k, v in self.ema.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(d).add_(msd[k].detach(), alpha=1 - d)
+
+
 def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch=40,
           monitor="cross_eer", P=None, K=None, model_kw=None, ds_va=None, ds_tr=None,
           mining="standard", wandb_run=None):
@@ -22,23 +48,40 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     n_ids = man_tr.ParticipantID.nunique()
     P = min(P, n_ids)                                         # can't sample more ids than exist
     net = model_fn(embed_dim=cfg["embed_dim"], n_classes=None, **(model_kw or {})).to(dev)
+    ema = ModelEMA(net)                                  # YOLO-style weight EMA; val runs on this
     crit = Criterion(cfg, n_ids, cfg["embed_dim"]).to(dev)
     mine = MINERS[mining]
     make_sampler = FootwearSpanningSampler if mining == "crossfw" else PKSampler
     # scale the LR to our batch (sqrt rule, suited to AdamW): cfg["lr"] is tuned for batch 128,
     # our 2D batch is 512 and 3D 256, so a bigger batch gets a proportionally bigger LR.
     eff_lr = cfg["lr"] * (P * K / 128) ** 0.5
-    opt = torch.optim.AdamW(list(net.parameters()) + list(crit.parameters()),
-                            lr=eff_lr, weight_decay=cfg.get("weight_decay", 5e-4))
-    # step-based schedule: warm up over the first few % of TOTAL steps (not a whole epoch, which
-    # would waste the first epoch at a near-zero LR), then cosine-decay over the rest. Stepped once
-    # per batch below.
+    clip_params = list(net.parameters()) + list(crit.parameters())   # for gradient clipping
+    opt = torch.optim.AdamW(clip_params, lr=eff_lr, weight_decay=cfg.get("weight_decay", 5e-4))
+    # YOLO-style per-iteration schedule (ultralytics): warm up over max(frac*total, 100) iters
+    # (a floor of 100 so short runs still warm up in STEPS, not a wasted epoch), LR ramping 0->target
+    # and AdamW beta1 ramping warmup_mom->0.9; then cosine-decay to lr*lrf (NOT 0 -- a nonzero floor
+    # keeps the tail stable instead of freezing the model). Set per batch in the loop below.
     total_steps = max(1, max_epochs * steps_per_epoch)
-    warmup_steps = max(1, round(cfg.get("warmup_frac", 0.05) * total_steps))
-    sched = torch.optim.lr_scheduler.SequentialLR(
-        opt, milestones=[warmup_steps],
-        schedulers=[torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.05, total_iters=warmup_steps),
-                    torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_steps - warmup_steps))])
+    nw = max(round(cfg.get("warmup_frac", 0.03) * total_steps), 100)
+    lrf = cfg.get("lrf", 0.05)                            # final LR = eff_lr * lrf
+    warmup_mom = 0.85
+    beta2 = opt.param_groups[0]["betas"][1]
+
+    def lr_cosine(it):                                   # eff_lr -> eff_lr*lrf over all steps
+        p = min(1.0, it / total_steps)
+        return eff_lr * (((1 + math.cos(math.pi * p)) / 2) * (1 - lrf) + lrf)
+
+    def set_schedule(it):                                # YOLO warmup + cosine, per iteration
+        target = lr_cosine(it)
+        if it < nw:
+            lr_now = float(np.interp(it, [0, nw], [0.0, target]))
+            mom = float(np.interp(it, [0, nw], [warmup_mom, 0.9]))
+        else:
+            lr_now, mom = target, 0.9
+        for g in opt.param_groups:
+            g["lr"] = lr_now
+            g["betas"] = (mom, beta2)
+        return lr_now
     use_amp = cfg["amp"] and dev == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
@@ -84,12 +127,16 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         steps = tqdm(epoch_batches(), total=steps_per_epoch, leave=False,
                      desc=f"{tag} ep {epoch + 1}/{max_epochs}")
         for xb, yb, fwb in steps:
+            set_schedule(gstep)                              # YOLO-style per-iteration LR + momentum
             opt.zero_grad()
             with torch.autocast(device_type=dev, enabled=use_amp):
                 f_t, f_i, _ = net(xb)
                 loss, l_id, l_tri = crit(f_t, f_i, yb, mine(f_t, yb, fwb))
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-            sched.step()                                     # step-based LR (warmup within ep1)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)                         # unscale, then clip gradients (YOLO: 10.0)
+            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=10.0)
+            scaler.step(opt); scaler.update()
+            ema.update(net)                              # nudge the EMA weights toward the live net
             gstep += 1
             lv = loss.item()
             ep_loss.append(lv); ep_id.append(l_id); ep_tri.append(l_tri)
@@ -104,12 +151,13 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
                 win = dict(loss=[], id=[], tri=[])
 
         lr = opt.param_groups[0]["lr"]                        # LR now stepped per batch, not here
-        fyf = embed_dataset(net, ds_va)                      # embed val once, reuse for both
-        s = summarise(leave_one_footwear_out(net, ds_va, precomp=fyf))   # cross-footwear (hard)
-        mixed5 = open_set_accumulated(net, ds_va, ks=(5,), repeats=2, precomp=fyf,
+        eval_net = ema.ema                                   # validate on the smoother EMA weights
+        fyf = embed_dataset(eval_net, ds_va)                 # embed val once, reuse for both
+        s = summarise(leave_one_footwear_out(eval_net, ds_va, precomp=fyf))   # cross-footwear (hard)
+        mixed5 = open_set_accumulated(eval_net, ds_va, ks=(5,), repeats=2, precomp=fyf,
                                       score_norm="znorm").get(5, float("nan"))   # cohort-normalized
         s["mixed_r5"] = mixed5                               # reference-protocol 5-step rank-1
-        cond = condition_verification(net, ds_va, precomp=fyf)   # competition seen/unseen EER etc.
+        cond = condition_verification(eval_net, ds_va, precomp=fyf)   # competition seen/unseen EER
         for c in ("seen", "unseen"):
             if cond.get(c):
                 s[f"{c}_eer"] = cond[c]["eer"]; s[f"{c}_fmr100"] = cond[c]["fmr100"]
@@ -132,8 +180,8 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
               f"{s.get('unseen_eer', float('nan'))*100:.1f}", flush=True)
 
         if val < best["val"] - 1e-4:
-            best.update(val=val, epoch=epoch,
-                        state={k: v.detach().cpu().clone() for k, v in net.state_dict().items()})
+            best.update(val=val, epoch=epoch,                # save the EMA weights (what we eval)
+                        state={k: v.detach().cpu().clone() for k, v in ema.ema.state_dict().items()})
             bad = 0
         else:
             bad += 1
@@ -142,7 +190,7 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
 
     del loader
     if best["state"] is not None:
-        net.load_state_dict(best["state"])
+        ema.ema.load_state_dict(best["state"])
     if dev == "cuda":
         torch.cuda.empty_cache()
-    return net, pd.DataFrame(hist), best
+    return ema.ema, pd.DataFrame(hist), best             # return the EMA model as the trained net
