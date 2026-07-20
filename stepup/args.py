@@ -38,11 +38,11 @@ def add_common_args(ap):
     d.set_defaults(augment=True, use_pack=True)
 
     l = ap.add_argument_group("loss / mining")
-    l.add_argument("--loss", default="arcface", choices=["arcface", "ce"],
-                   help="ID loss. Default SubCenter-ArcFace s=16 (the reference recipe: angular "
-                        "margin -> tight open-set clusters that transfer to unseen ids). CE is "
-                        "kept for ablation only -- it caps open-set rank-1 ~0.5 (verified), so it "
-                        "is NOT the default.")
+    l.add_argument("--loss", default="arcface", choices=["arcface", "supcon", "ce"],
+                   help="ID loss. Default single-center ArcFace s=16 on the L2-normed embedding "
+                        "(reference recipe, no triplet). 'supcon' = supervised contrastive (the "
+                        "CodaBench baseline objective). 'ce' = label-smoothed CE + triplet "
+                        "(ablation; caps open-set rank-1 lower).")
     l.add_argument("--arc-scale", type=float, default=16.0,
                    help="ArcFace scale s (reference uses 16; lower = gentler)")
     l.add_argument("--mining", default="standard", choices=["standard", "crossfw"],

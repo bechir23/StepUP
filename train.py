@@ -21,8 +21,9 @@ from stepup.args import add_common_args, apply_smoke
 from stepup.config import ARTIFACTS, T, build_cfg, seed_everything
 from stepup.data import build_datasets
 from stepup.engine import train
-from stepup.eval import (accumulated_identification, cross_footwear_verification,
-                         leave_one_footwear_out, plot_embeddings, plot_history, summarise)
+from stepup.eval import (accumulated_identification, condition_verification,
+                         cross_footwear_verification, leave_one_footwear_out,
+                         plot_embeddings, plot_history, summarise)
 from stepup.models import registry, set_dropout
 from stepup.wb import init_run
 
@@ -74,10 +75,18 @@ def main():
         pd.DataFrame([vr]).to_parquet(ARTIFACTS / f"verif_{name}.parquet", index=False)
         acc = accumulated_identification(net, ds["test"])
         pd.DataFrame([acc]).to_parquet(ARTIFACTS / f"acc_{name}.parquet", index=False)
+        cond = condition_verification(net, ds["test"])                 # competition seen/unseen split
+        pd.DataFrame(cond).T.to_parquet(ARTIFACTS / f"cond_{name}.parquet")
         s = summarise(ev)
         print(f"\n{name} TEST  cross rank1 {s.get('cross_rank1', float('nan')):.3f}  "
               f"EER {vr['eer']:.3f}  BACC {vr['balanced_accuracy']:.3f}  F1 {vr['f1']:.3f}  "
               f"recall {vr['recall']:.3f}")
+        for c in ("seen", "unseen"):                                    # competition metric set
+            r = cond.get(c)
+            if r:
+                print(f"  {c:6s} EER {r['eer']*100:5.2f}  FMR100 {r['fmr100']*100:5.2f}  "
+                      f"ACC {r['accuracy']*100:5.2f}  BACC {r['balanced_accuracy']*100:5.2f}  "
+                      f"FNMR {r['fnmr']*100:5.2f}  FMR {r['fmr']*100:5.2f}")
         print("  accumulated rank1  " + "  ".join(f"{k}-step {v:.3f}" for k, v in acc.items()))
         if args.plot_embed:
             p = plot_embeddings(net, ds["test"], f"{name} test embeddings",

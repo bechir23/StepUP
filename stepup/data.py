@@ -6,6 +6,7 @@ resolution-tagged, read from the artifacts folder) or streams the original npz t
 """
 import itertools
 import json
+import os
 import pathlib
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -13,8 +14,14 @@ from functools import lru_cache
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, Sampler
 from torchvision.transforms.functional import affine as tv_affine
+
+# Temporal-aug resampling mode. Default is smooth trilinear interpolate (best quality; the A100
+# has the RAM). Set STEPUP_LIGHT_AUG=1 for nearest-frame index-gather -- near-zero extra memory,
+# for the RAM-starved local card.
+_LIGHT_TEMPORAL = os.environ.get("STEPUP_LIGHT_AUG") == "1"
 
 from .config import (ARTIFACTS, COLAB, DATA, FW2CODE, FOOTWEAR, ROOT, SEED, SPEEDS,
                      T, H, W, seed_everything)
@@ -111,6 +118,17 @@ class _AugMixin:
         """Winner recipe plus regularizers (gamma, random erasing) to fight overfitting.
         No horizontal flip (that undoes the medial-lateral mirror)."""
         x = x + 0.02 * torch.randn_like(x)
+        if torch.rand(1).item() < 0.5:              # temporal crop + resample (stance-phase timing
+            tt = x.shape[-3]                        # jitter): same footstep at a slightly different
+            a = int(torch.randint(0, max(1, tt // 6), (1,)))          # walking cadence. Crops up to
+            b = tt - int(torch.randint(0, max(1, tt // 6), (1,)))     # ~1/6 off each end and resamples
+            if b - a >= 8:                                            # back to the full stance length.
+                if _LIGHT_TEMPORAL:                                   # low-RAM (local): nearest-frame
+                    idx = torch.linspace(a, b - 1, tt).round().long().clamp(0, tt - 1)  # index-gather
+                    x = x[:, idx]
+                else:                                                # default (Colab): smooth resample
+                    x = F.interpolate(x[:, a:b].unsqueeze(0), size=(tt, x.shape[-2], x.shape[-1]),
+                                      mode="trilinear", align_corners=False).squeeze(0)
         if torch.rand(1).item() < 0.3:
             x = x * (torch.rand(x.shape[-2:], device=x.device) > 0.05).float()
         if torch.rand(1).item() < 0.5:

@@ -7,7 +7,8 @@ from tqdm.auto import tqdm
 
 from .config import SEED, dev, seed_everything
 from .data import FootstepData, FootwearSpanningSampler, PKSampler
-from .eval import (embed_dataset, leave_one_footwear_out, open_set_accumulated, summarise)
+from .eval import (condition_verification, embed_dataset, leave_one_footwear_out,
+                   open_set_accumulated, summarise)
 from .losses import MINERS, Criterion
 
 
@@ -29,11 +30,15 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     eff_lr = cfg["lr"] * (P * K / 128) ** 0.5
     opt = torch.optim.AdamW(list(net.parameters()) + list(crit.parameters()),
                             lr=eff_lr, weight_decay=cfg.get("weight_decay", 5e-4))
-    warmup = max(1, round(cfg.get("warmup_frac", 0.1) * max_epochs))
+    # step-based schedule: warm up over the first few % of TOTAL steps (not a whole epoch, which
+    # would waste the first epoch at a near-zero LR), then cosine-decay over the rest. Stepped once
+    # per batch below.
+    total_steps = max(1, max_epochs * steps_per_epoch)
+    warmup_steps = max(1, round(cfg.get("warmup_frac", 0.05) * total_steps))
     sched = torch.optim.lr_scheduler.SequentialLR(
-        opt, milestones=[warmup],
-        schedulers=[torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.05, total_iters=warmup),
-                    torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, max_epochs - warmup))])
+        opt, milestones=[warmup_steps],
+        schedulers=[torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.05, total_iters=warmup_steps),
+                    torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_steps - warmup_steps))])
     use_amp = cfg["amp"] and dev == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
@@ -84,6 +89,7 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
                 f_t, f_i, _ = net(xb)
                 loss, l_id, l_tri = crit(f_t, f_i, yb, mine(f_t, yb, fwb))
             scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+            sched.step()                                     # step-based LR (warmup within ep1)
             gstep += 1
             lv = loss.item()
             ep_loss.append(lv); ep_id.append(l_id); ep_tri.append(l_tri)
@@ -97,11 +103,20 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
                     wandb_run.log(r)
                 win = dict(loss=[], id=[], tri=[])
 
-        lr = opt.param_groups[0]["lr"]; sched.step()
+        lr = opt.param_groups[0]["lr"]                        # LR now stepped per batch, not here
         fyf = embed_dataset(net, ds_va)                      # embed val once, reuse for both
         s = summarise(leave_one_footwear_out(net, ds_va, precomp=fyf))   # cross-footwear (hard)
-        mixed5 = open_set_accumulated(net, ds_va, ks=(5,), repeats=1, precomp=fyf).get(5, float("nan"))
+        mixed5 = open_set_accumulated(net, ds_va, ks=(5,), repeats=2, precomp=fyf,
+                                      score_norm="znorm").get(5, float("nan"))   # cohort-normalized
         s["mixed_r5"] = mixed5                               # reference-protocol 5-step rank-1
+        cond = condition_verification(net, ds_va, precomp=fyf)   # competition seen/unseen EER etc.
+        for c in ("seen", "unseen"):
+            if cond.get(c):
+                s[f"{c}_eer"] = cond[c]["eer"]; s[f"{c}_fmr100"] = cond[c]["fmr100"]
+        del fyf                                              # free the per-epoch val embeddings
+        import gc; gc.collect()                              # reclaim RAM between epochs (low-RAM cards)
+        if dev == "cuda":
+            torch.cuda.empty_cache()
         val = s.get(monitor, float("inf"))                  # early-stop on cross_eer (invariance)
         er = dict(step=gstep, epoch=epoch, lr=lr, train_loss=float(np.mean(ep_loss)),
                   id_loss=float(np.mean(ep_id)), triplet_loss=float(np.mean(ep_tri)), **s)
@@ -112,7 +127,9 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
               f"id {er['id_loss']:6.3f}  tri {er['triplet_loss']:5.3f}  lr {lr:.2e}  "
               f"val_eer {s.get('cross_eer', float('nan')):.3f}  "
               f"val_r1(cross) {s.get('cross_rank1', float('nan')):.3f}  "
-              f"val_r1(mixed5) {mixed5:.3f}", flush=True)
+              f"val_r1(mixed5) {mixed5:.3f}  "
+              f"EER(seen/unseen) {s.get('seen_eer', float('nan'))*100:.1f}/"
+              f"{s.get('unseen_eer', float('nan'))*100:.1f}", flush=True)
 
         if val < best["val"] - 1e-4:
             best.update(val=val, epoch=epoch,

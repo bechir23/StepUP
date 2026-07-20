@@ -120,6 +120,47 @@ def make_gaitcnn(embed_dim=128, n_classes=None, in_frames=T):
     return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
 
 
+class ResBlock2d(nn.Module):
+    """Standard 3x3 residual block; the skip keeps gradients healthy as depth grows."""
+
+    def __init__(self, cin, cout, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(cin, cout, 3, stride, 1, bias=False); self.bn1 = nn.BatchNorm2d(cout)
+        self.conv2 = nn.Conv2d(cout, cout, 3, 1, 1, bias=False); self.bn2 = nn.BatchNorm2d(cout)
+        self.short = (nn.Identity() if stride == 1 and cin == cout else
+                      nn.Sequential(nn.Conv2d(cin, cout, 1, stride, bias=False), nn.BatchNorm2d(cout)))
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        return F.relu(self.bn2(self.conv2(out)) + self.short(x), inplace=True)
+
+
+class GaitCNNDeep(nn.Module):
+    """Deeper residual 2D-CNN over the 75x40 map (8 res-blocks, widths to 512): more capacity
+    than the 4-block gaitcnn, with residual skips. Only helps if regularized (dropout + aug) and
+    trained at a low LR -- otherwise the extra capacity just memorizes faster."""
+
+    def __init__(self, in_frames=T, widths=(64, 128, 256, 512)):
+        super().__init__()
+        c0, c1, c2, c3 = widths
+        self.stem = nn.Sequential(nn.Conv2d(in_frames, c0, 3, 1, 1, bias=False),
+                                  nn.BatchNorm2d(c0), nn.ReLU(inplace=True))
+        self.layers = nn.Sequential(
+            ResBlock2d(c0, c0), ResBlock2d(c0, c1, 2),      # 75x40 -> 38x20
+            ResBlock2d(c1, c1), ResBlock2d(c1, c2, 2),      # -> 19x10
+            ResBlock2d(c2, c2), ResBlock2d(c2, c3, 2),      # -> 10x5
+            ResBlock2d(c3, c3), nn.AdaptiveAvgPool2d(1))
+        self.out_dim = c3
+
+    def forward(self, x):
+        return self.layers(self.stem(x.squeeze(1))).flatten(1)
+
+
+def make_gaitcnn_deep(embed_dim=128, n_classes=None, in_frames=T):
+    net = GaitCNNDeep(in_frames=in_frames)
+    return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
+
+
 class CNNLSTM(nn.Module):
     """LRCN (Donahue et al. 2015): ResNet-18 frame encoder + LSTM over subsampled frames."""
 
@@ -242,6 +283,8 @@ def registry(sample3d, data_t=T):
     return {
         "gaitcnn":  dict(fn=make_gaitcnn, kw=dict(in_frames=data_t), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "gaitcnn_deep": dict(fn=make_gaitcnn_deep, kw=dict(in_frames=data_t), full_pk=pk2d,
+                             smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "resnet2d": dict(fn=make_resnet2d, kw=dict(in_frames=data_t), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "cnnlstm":  dict(fn=make_cnnlstm, kw=dict(n_frames=min(32, data_t)), full_pk=pk2d,

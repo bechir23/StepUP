@@ -73,6 +73,11 @@ class Criterion(nn.Module):
             self._m_target = 0.5
             self.arc.set_margin(0.0)
             self.ce = nn.CrossEntropyLoss()
+        elif self.kind == "supcon":
+            # supervised contrastive (Khosla et al. 2020), the CodaBench StepUP baseline objective:
+            # pulls same-identity embeddings together, pushes others apart, directly on the unit
+            # sphere. No classifier head, no margin -- an alternative to ArcFace to compare against.
+            self.supcon = losses.SupConLoss(temperature=cfg.get("supcon_temp", 0.1))
         else:
             # BNNeck "bag of tricks": label-smoothed CE ID head + triplet (kept for the ce ablation)
             self.id_head = nn.Linear(embed_dim, n_ids)
@@ -88,6 +93,9 @@ class Criterion(nn.Module):
         if self.kind == "arcface":
             l_id = self.ce(self.arc(F.normalize(f_i), yb), yb)   # ArcFace on L2-normed embedding
             return l_id, l_id.item(), 0.0                         # no triplet (matches reference)
+        if self.kind == "supcon":
+            l = self.supcon(F.normalize(f_i), yb)                 # supervised contrastive
+            return l, l.item(), 0.0
         l_id = self.ce(self.id_head(f_i), yb)
         l_tri = self.triplet(f_t, yb, mined)
         return l_id + l_tri, l_id.item(), l_tri.item()

@@ -61,6 +61,9 @@ def report_from_scores(scores, labels):
     rec = tp / max(1, tp + fn)
     fmr = fp / max(1, fp + tn)
     fnmr = fn / max(1, fn + tp)
-    return dict(eer=float((fpr[i] + fnr[i]) / 2), accuracy=(tp + tn) / max(1, len(labels)),
+    # FMR100 (competition security metric): false-match rate at the threshold where FNMR <= 1%.
+    fmr100 = float(fpr[np.argmax(fnr <= 0.01)]) if (fnr <= 0.01).any() else 1.0
+    return dict(eer=float((fpr[i] + fnr[i]) / 2), fmr100=fmr100,
+                accuracy=(tp + tn) / max(1, len(labels)),
                 balanced_accuracy=1 - (fmr + fnmr) / 2, precision=prec, recall=rec,
                 f1=2 * prec * rec / max(1e-9, prec + rec), fmr=fmr, fnmr=fnmr)
