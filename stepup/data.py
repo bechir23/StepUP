@@ -90,13 +90,24 @@ def build_split(seed=1337):
 
 
 def get_split():
+    """Identity lists per split. Always returns {split: [participant ids]}.
+
+    The cached file is only trusted if it is genuinely a roster of the expected sizes -- an old
+    100/25/25 file, a file that stores counts instead of ids, or anything unreadable is discarded
+    and rebuilt rather than handed back in a shape the callers cannot use."""
     path = ARTIFACTS / "identity_split.json"
     if path.exists():
-        cached = json.loads(path.read_text())
-        # invalidate a stale split (e.g. an old 100/25/25 file) so changing SPLIT_SIZES actually
-        # takes effect instead of silently reusing the previous roster.
-        if all(len(cached.get(k, [])) == n for k, n in SPLIT_SIZES.items()):
+        try:
+            cached = json.loads(path.read_text())
+            ok = isinstance(cached, dict) and all(
+                isinstance(cached.get(k), list) and len(cached[k]) == n
+                for k, n in SPLIT_SIZES.items())
+        except Exception:
+            ok = False
+        if ok:
             return cached
+        print(f"discarding stale/invalid {path.name}; rebuilding the "
+              f"{'/'.join(str(v) for v in SPLIT_SIZES.values())} split", flush=True)
     split = build_split()
     path.write_text(json.dumps(split, indent=1))
     return split
