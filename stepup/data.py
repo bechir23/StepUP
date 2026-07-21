@@ -347,7 +347,21 @@ def build_pack(split_name, manifest, res=None, mirror_right=True, overwrite=Fals
             return found
     path = pack_path(split_name, res, mirror=mirror_right)
     m = manifest.reset_index(drop=True)
-    mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.uint8, shape=(len(m), 1, *want))
+    # Build into a temporary file and move it into place only once it is complete.
+    #  * Google Drive's FUSE mount does not handle the random-access writes a memmap performs;
+    #    building straight onto Drive stalls or corrupts. Set STEPUP_SCRATCH to a local path
+    #    (e.g. /content) so the pack is assembled on real disk and then copied across in one
+    #    sequential write.
+    #  * It also means an interrupted build cannot leave a correctly-shaped, zero-filled file at
+    #    the destination that the reuse check would happily accept.
+    import shutil
+    scratch = os.environ.get("STEPUP_SCRATCH")
+    tmp_dir = pathlib.Path(scratch) if scratch else path.parent
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp = tmp_dir / (path.name + ".building")
+    if tmp.exists():
+        tmp.unlink()
+    mm = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.uint8, shape=(len(m), 1, *want))
     groups = list(m.groupby(["ParticipantID", "Footwear", "Speed"]))
 
     def fill(item):
@@ -364,6 +378,11 @@ def build_pack(split_name, manifest, res=None, mirror_right=True, overwrite=Fals
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         list(tqdm(ex.map(fill, groups), total=len(groups), desc=f"pack {split_name}"))
     mm.flush()
+    del mm                                   # release the mapping before moving the file
+    if tmp.resolve() != path.resolve():
+        print(f"  moving {split_name} pack -> {path} ({tmp.stat().st_size / 2**30:.1f} GB)",
+              flush=True)
+        shutil.move(str(tmp), str(path))     # single sequential write at the destination
     return path
 
 
