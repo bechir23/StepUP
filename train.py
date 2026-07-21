@@ -40,6 +40,8 @@ def main():
     set_dropout(cfg["dropout"])
     seed_everything()
     data_t = cfg["pack_res"][0] if cfg["pack_res"] else T
+    if cfg.get("stride_pairs"):
+        data_t *= 2                      # a stride = left+right concatenated in time
     reg = registry(cfg["sample3d"], data_t)
     names = list(reg) if args.model == "all" else [args.model]
     assert all(n in reg for n in names), f"unknown model; choose from {list(reg)}"
@@ -51,11 +53,12 @@ def main():
 
     for name in names:
         spec = reg[name]
+        cfg["lr_mult"] = spec.get("lr_mult", 1.0)     # heavy nets auto-get a lower LR
         P0, K0 = spec["full_pk"]
         P, K = args.P or P0, args.K or K0            # --P/--K override the per-model batch
         mkw = dict(spec["kw"])
-        if args.mixstyle and name in ("r2plus1d", "r3d"):
-            mkw["mixstyle"] = True                    # MixStyle only in the video ResNets
+        if args.mixstyle and name in ("r2plus1d", "r2plus1d_light", "r3d", "r3d_light", "gaitcnn"):
+            mkw["mixstyle"] = True                    # footwear-invariance: mix instance stats early
         steps = cfg["steps_per_epoch"] or max(1, len(man["train"]) // (P * K))
         run = init_run(args, cfg, name)
         net, hist, best = train(spec["fn"], man["train"], cfg, tag=name,

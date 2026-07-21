@@ -54,7 +54,10 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     make_sampler = FootwearSpanningSampler if mining == "crossfw" else PKSampler
     # scale the LR to our batch (sqrt rule, suited to AdamW): cfg["lr"] is tuned for batch 128,
     # our 2D batch is 512 and 3D 256, so a bigger batch gets a proportionally bigger LR.
-    eff_lr = cfg["lr"] * (P * K / 128) ** 0.5
+    # LR scaled to batch (sqrt rule), then times a per-model factor: the heavy 3D nets (r2plus1d/
+    # r3d/swin3d/vit) overfit fast and want a much lower LR than the 2D nets -- without this the
+    # default lands at ~1.4e-3 for r2plus1d, which memorizes in ~10 epochs and craters val.
+    eff_lr = cfg["lr"] * (P * K / 128) ** 0.5 * cfg.get("lr_mult", 1.0)
     clip_params = list(net.parameters()) + list(crit.parameters())   # for gradient clipping
     opt = torch.optim.AdamW(clip_params, lr=eff_lr, weight_decay=cfg.get("weight_decay", 5e-4))
     # YOLO-style per-iteration schedule (ultralytics): warm up over max(frac*total, 100) iters
@@ -118,13 +121,21 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     # ~half-target at epoch 1), which inflates the early loss and hurts convergence.
     margin_warmup = min(max_epochs, 5)
     patience = patience if patience and patience > 0 else float("inf")   # YOLO: 0 -> train all epochs
-    best = dict(val=-float("inf"), state=None, epoch=-1)   # maximise the composite fitness
+    # Early-stop robustness (small 15-id val gallery -> noisy per-epoch EER). Two guards so a run
+    # is stopped only when it has *genuinely* stopped improving, not on a single unlucky epoch:
+    #  (1) a min-epoch floor: never stop before the margin has finished ramping and the schedule
+    #      has come off warmup -- stopping in that volatile window was the "it always early-stops"
+    #      symptom; (2) the stop/best decision is on a 3-epoch trailing mean of the fitness, so one
+    #      noisy dip doesn't reset the model or one noisy spike doesn't lock in a fluke best.
+    min_stop_epoch = max(margin_warmup + 5, max_epochs // 4)
+    fit_window = []
+    best = dict(val=-float("inf"), state=None, epoch=-1)   # maximise the (smoothed) fitness
     hist, bad, gstep = [], 0, 0
     win = dict(loss=[], id=[], tri=[])                       # window since the last step-log
     for epoch in range(max_epochs):
         crit.set_margin_frac((epoch + 1) / margin_warmup)   # ArcFace margin ramp (no-op for CE)
         net.train(); crit.train()
-        ep_loss, ep_id, ep_tri = [], [], []
+        ep_loss, ep_id, ep_tri, ep_gn = [], [], [], []
         steps = tqdm(epoch_batches(), total=steps_per_epoch, leave=False,
                      desc=f"{tag} ep {epoch + 1}/{max_epochs}")
         for xb, yb, fwb in steps:
@@ -132,10 +143,15 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
             opt.zero_grad()
             with torch.autocast(device_type=dev, enabled=use_amp):
                 f_t, f_i, _ = net(xb)
-                loss, l_id, l_tri = crit(f_t, f_i, yb, mine(f_t, yb, fwb))
+                loss, l_id, l_tri = crit(f_t, f_i, yb, mine(f_t, yb, fwb), fwb)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)                         # unscale, then clip gradients (YOLO: 10.0)
-            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=10.0)
+            # capture the pre-clip total gradient norm: this is the direct read on whether the
+            # model is still learning. If it collapses toward 0 while val is flat, the objective
+            # has saturated (the model has memorised the training identities) and no amount of
+            # further epochs will help -- that is the "climbs then blocks" signature.
+            gn = torch.nn.utils.clip_grad_norm_(clip_params, max_norm=10.0)
+            ep_gn.append(float(gn))
             scaler.step(opt); scaler.update()
             ema.update(net)                              # nudge the EMA weights toward the live net
             gstep += 1
@@ -155,7 +171,11 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         eval_net = ema.ema                                   # validate on the smoother EMA weights
         fyf = embed_dataset(eval_net, ds_va)                 # embed val once, reuse for both
         s = summarise(leave_one_footwear_out(eval_net, ds_va, precomp=fyf))   # cross-footwear (hard)
-        mixed5 = open_set_accumulated(eval_net, ds_va, ks=(5,), repeats=2, precomp=fyf,
+        # repeats=5 (was 2): mixed5 averages over random enrollment draws, so few draws make the
+        # per-epoch number bounce +-0.03-0.04 purely from sampling. More draws = a materially
+        # smoother curve at negligible cost (the embeddings are already computed), which stops
+        # noise from being mistaken for the model oscillating.
+        mixed5 = open_set_accumulated(eval_net, ds_va, ks=(5,), repeats=5, precomp=fyf,
                                       score_norm="znorm").get(5, float("nan"))   # cohort-normalized
         s["mixed_r5"] = mixed5                               # reference-protocol 5-step rank-1
         cond = condition_verification(eval_net, ds_va, precomp=fyf)   # competition seen/unseen EER
@@ -173,8 +193,10 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
                    + 0.35 * (1 - s.get("unseen_eer", 0.5))   # unseen footwear -- the hard target
                    + 0.25 * (1 - s.get("cross_eer", 0.5)))   # cross-footwear invariance
         s["fitness"] = fitness
+        grad_norm = float(np.mean(ep_gn)) if ep_gn else float("nan")
         er = dict(step=gstep, epoch=epoch, lr=lr, train_loss=float(np.mean(ep_loss)),
-                  id_loss=float(np.mean(ep_id)), triplet_loss=float(np.mean(ep_tri)), **s)
+                  id_loss=float(np.mean(ep_id)), triplet_loss=float(np.mean(ep_tri)),
+                  grad_norm=grad_norm, **s)
         hist.append(er)
         if wandb_run is not None:
             wandb_run.log({"step": gstep, "epoch": epoch, "lr": lr, **s})
@@ -184,15 +206,20 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
               f"val_r1(cross) {s.get('cross_rank1', float('nan')):.3f}  "
               f"val_r1(mixed5) {mixed5:.3f}  "
               f"EER(seen/unseen) {s.get('seen_eer', float('nan'))*100:.1f}/"
-              f"{s.get('unseen_eer', float('nan'))*100:.1f}  fit {fitness:.3f}", flush=True)
+              f"{s.get('unseen_eer', float('nan'))*100:.1f}  gn {grad_norm:.2f}  "
+              f"fit {fitness:.3f}", flush=True)
 
-        if fitness > best["val"] + 1e-4:                     # maximise fitness (was: minimise eer)
-            best.update(val=fitness, epoch=epoch,            # save the EMA weights (what we eval)
+        fit_window.append(fitness)                           # smoothed fitness = mean of last 3
+        smooth = float(np.mean(fit_window[-3:]))
+        if smooth > best["val"] + 1e-4:                      # maximise the smoothed fitness
+            best.update(val=smooth, epoch=epoch,             # save the EMA weights (what we eval)
                         state={k: v.detach().cpu().clone() for k, v in ema.ema.state_dict().items()})
             bad = 0
         else:
             bad += 1
-            if bad >= patience:
+            if bad >= patience and epoch + 1 >= min_stop_epoch:   # floor: give every run a fair shot
+                print(f"  early stop: no improvement in {bad} epochs (best fit {best['val']:.3f} "
+                      f"@ ep {best['epoch']+1})", flush=True)
                 break
 
     del loader

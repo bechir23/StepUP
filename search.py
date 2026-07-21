@@ -80,6 +80,7 @@ def main():
         name = pick["model"]
         data_t = cfg["pack_res"][0] if cfg["pack_res"] else T
         spec = registry(cfg["sample3d"], data_t)[name]
+        cfg["lr_mult"] = spec.get("lr_mult", 1.0)
         P, K = (args.P or spec["full_pk"][0]), (args.K or spec["full_pk"][1])
         steps = max(1, len(man["train"]) // (P * K))
         print(f"\n=== trial {t+1}/{args.trials}: {name} loss={pick['loss']} lr={pick['lr']} "
@@ -131,6 +132,7 @@ def main():
         name = best["model"]
         data_t = cfg["pack_res"][0] if cfg["pack_res"] else T
         spec = registry(cfg["sample3d"], data_t)[name]
+        cfg["lr_mult"] = spec.get("lr_mult", 1.0)
         P, K = (args.P or spec["full_pk"][0]), (args.K or spec["full_pk"][1])
         steps = max(1, len(man["train"]) // (P * K))
         print(f"\n=== FINAL: training best config to completion ({name}, loss={best['loss']}, "

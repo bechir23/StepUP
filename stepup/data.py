@@ -1,7 +1,7 @@
 """Data layer: metadata, identity split, preprocessing, datasets, PK samplers, and packs.
 
 A footstep = one cube slice (101,75,40). Metadata is built once and cached; the split is the
-frozen identity-disjoint 100/25/25. Training reads from a per-split uint8 pack (built once,
+frozen identity-disjoint 120/15/15. Training reads from a per-split uint8 pack (built once,
 resolution-tagged, read from the artifacts folder) or streams the original npz trials.
 """
 import itertools
@@ -49,14 +49,35 @@ def get_metadata():
     return steps, steps.query("Exclude == False")
 
 
+def split_sizes():
+    """Identity counts per split, of 150. Default 120/15/15; override with STEPUP_SPLIT="a,b,c"
+    (e.g. "100,25,25") to reuse packs built under an older split for a fast local check."""
+    e = os.environ.get("STEPUP_SPLIT")
+    if e:
+        a, b, c = (int(x) for x in e.split(","))
+        return {"train": a, "val": b, "test": c}
+    return {"train": 120, "val": 15, "test": 15}
+
+
+SPLIT_SIZES = split_sizes()
+
+
 def build_split(seed=1337):
-    """Identity-disjoint 100/25/25, stratified by sex x foot-length tertile x age tertile."""
+    """Identity-disjoint split (default 120/15/15), stratified by sex x foot-length tertile x age
+    tertile. More train identities lifts the open-set ceiling (the val/test rank-1 a model can
+    reach on unseen people is bounded by how many identities it learned to separate); the
+    reference's ~0.9 used a comparably large train roster. Val/test at 15 ids each is a smaller,
+    noisier gallery, so per-epoch EER wobbles more (handled by the fitness smoothing in engine)."""
+    sizes = split_sizes()
     people = pd.read_csv(ROOT / "participant_metadata.csv")
     rng = np.random.default_rng(seed)
     df = people.copy()
     df["foot_bin"] = pd.qcut(df["RightFootLength (cm)"], 3, labels=False, duplicates="drop")
     df["age_bin"] = pd.qcut(df.Age, 3, labels=False, duplicates="drop")
-    pattern = ["train"] * 4 + ["val", "test"]
+    from math import gcd
+    g = gcd(gcd(sizes["train"], sizes["val"]), sizes["test"]) or 1
+    pattern = (["train"] * (sizes["train"] // g)         # e.g. 120/15/15 -> 8:1:1, 100/25/25 -> 4:1:1
+               + ["val"] * (sizes["val"] // g) + ["test"] * (sizes["test"] // g))
     out = {"train": [], "val": [], "test": []}
     cursor = 0
     for _, grp in df.groupby(["Sex", "foot_bin", "age_bin"], sort=True):
@@ -71,7 +92,11 @@ def build_split(seed=1337):
 def get_split():
     path = ARTIFACTS / "identity_split.json"
     if path.exists():
-        return json.loads(path.read_text())
+        cached = json.loads(path.read_text())
+        # invalidate a stale split (e.g. an old 100/25/25 file) so changing SPLIT_SIZES actually
+        # takes effect instead of silently reusing the previous roster.
+        if all(len(cached.get(k, [])) == n for k, n in SPLIT_SIZES.items()):
+            return cached
     split = build_split()
     path.write_text(json.dumps(split, indent=1))
     return split
@@ -82,11 +107,15 @@ def get_manifest(split_name, clean=None, split=None):
     Reuses the cached manifest_{split}.parquet if present (this is the exact order the packs
     were built from, so the pack rows stay aligned) and only rebuilds it otherwise."""
     cached = ARTIFACTS / f"manifest_{split_name}.parquet"
-    if cached.exists():
-        return pd.read_parquet(cached).reset_index(drop=True)
-    clean = clean if clean is not None else get_metadata()[1]
     split = split if split is not None else get_split()
     pids = set(split[split_name])
+    if cached.exists():
+        man = pd.read_parquet(cached).reset_index(drop=True)
+        if set(man.ParticipantID.unique()) == pids:      # matches the current split -> reuse
+            return man
+        # stale manifest (its identities no longer match the split) -> rebuild, which also forces
+        # the pack row-count to change so existing_pack_path rejects the old pack too.
+    clean = clean if clean is not None else get_metadata()[1]
     sub = clean[clean.ParticipantID.isin(pids) & clean.Speed.isin(SPEEDS)]
     man = sub[["ParticipantID", "Footwear", "Speed", "PassID",
                "FootstepID", "Side", "row"]].reset_index(drop=True)
@@ -243,8 +272,26 @@ def _res_tag(res):
     return f"{r[0]}x{r[1]}x{r[2]}"
 
 
-def pack_path(split_name, res):
-    return ARTIFACTS / f"pack_{split_name}_{_res_tag(res)}_u8.npy"
+def pack_path(split_name, res, mirror=True):
+    """mirror=False packs keep the true left/right footprint (no medial-lateral flip), which is
+    what stride pairing needs -- mirroring right onto left destroys gait asymmetry."""
+    suf = "" if mirror else "_nomir"
+    return ARTIFACTS / f"pack_{split_name}_{_res_tag(res)}{suf}_u8.npy"
+
+
+def stride_pairs(manifest):
+    """Group consecutive opposite-side footsteps into (left, right) stride pairs, following the
+    organisers' own loader. A stride carries left/right asymmetry and inter-foot timing -- signal
+    that a single (mirrored) footstep throws away entirely."""
+    m = manifest.reset_index(drop=True)
+    side = m.Side.to_numpy(); fid = m.FootstepID.to_numpy()
+    out = []
+    for _, g in m.groupby(["ParticipantID", "PassID", "Footwear", "Speed"], sort=False):
+        idx = g.index.to_numpy()
+        for i, j in zip(idx[:-1], idx[1:]):
+            if side[i] != side[j] and abs(int(fid[i]) - int(fid[j])) == 1:
+                out.append([i, j] if side[i] == "Left" else [j, i])
+    return np.asarray(out, dtype=np.int64).reshape(-1, 2)
 
 
 def _matches(path, n, want):
@@ -257,14 +304,16 @@ def _matches(path, n, want):
     return ok
 
 
-def existing_pack_path(split_name, manifest, res):
+def existing_pack_path(split_name, manifest, res, mirror=True):
     """The pack file to read: the resolution-tagged name, or the legacy untagged
     `pack_{split}_u8.npy` (from earlier runs) if it exists and matches the resolution."""
     want = tuple(res or (T, H, W))
     n = len(manifest)
-    tagged = pack_path(split_name, res)
+    tagged = pack_path(split_name, res, mirror=mirror)
     if _matches(tagged, n, want):
         return tagged
+    if not mirror:
+        return tagged                       # unmirrored packs never fall back to the legacy name
     legacy = ARTIFACTS / f"pack_{split_name}_u8.npy"
     if _matches(legacy, n, want):
         return legacy
@@ -279,10 +328,13 @@ def build_pack(split_name, manifest, res=None, mirror_right=True, overwrite=Fals
     from tqdm.auto import tqdm
     want = tuple(res or (T, H, W))
     if not overwrite:
-        found = existing_pack_path(split_name, manifest, res)
-        if found.exists():
+        found = existing_pack_path(split_name, manifest, res, mirror=mirror_right)
+        # reuse only if it actually MATCHES this manifest -- merely existing is not enough.
+        # A pack built for a different identity subset has the right name and resolution but the
+        # wrong number of rows, and silently reusing it indexes past the end of the array.
+        if _matches(found, len(manifest), want):
             return found
-    path = pack_path(split_name, res)
+    path = pack_path(split_name, res, mirror=mirror_right)
     m = manifest.reset_index(drop=True)
     mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.uint8, shape=(len(m), 1, *want))
     groups = list(m.groupby(["ParticipantID", "Footwear", "Speed"]))
@@ -302,6 +354,43 @@ def build_pack(split_name, manifest, res=None, mirror_right=True, overwrite=Fals
         list(tqdm(ex.map(fill, groups), total=len(groups), desc=f"pack {split_name}"))
     mm.flush()
     return path
+
+
+class PairedPackedData(Dataset, _AugMixin):
+    """One item = one STRIDE: the left and right footstep of a consecutive pair, concatenated
+    along time -> (1, 2T, H, W). Needs an UNMIRRORED pack so left/right asymmetry survives.
+    This adds information (asymmetry + inter-foot timing) rather than removing nuisance, which
+    is what is needed to raise the ceiling rather than trade one metric for another."""
+
+    def __init__(self, split_name, manifest, res=None, augment=False, device="memmap",
+                 rows=None, mirror=False):
+        path = existing_pack_path(split_name, manifest, res, mirror=mirror)
+        full = manifest.reset_index(drop=True)
+        pairs = stride_pairs(full)
+        if rows is not None:                       # subsample strides, not footsteps
+            pairs = pairs[np.asarray(rows, dtype=np.int64)]
+        self.pairs = pairs
+        self.device = device
+        self.augment = augment
+        self.mm = np.load(path, mmap_mode="r" if device == "memmap" else None)
+        assert len(self.mm) == len(full), \
+            f"pack has {len(self.mm)} rows but manifest has {len(full)}; rebuild the pack"
+        self.m = full.iloc[self.pairs[:, 0]].reset_index(drop=True)   # stride labelled by its left step
+        self.pid2label = {p: i for i, p in enumerate(sorted(self.m.ParticipantID.unique()))}
+        self.label = self.m.ParticipantID.map(self.pid2label).to_numpy()
+        self.fw = self.m.Footwear.map(FW2CODE).to_numpy()
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, i):
+        a, b = self.pairs[i]
+        xa = np.asarray(self.mm[a], dtype=np.float32) / 255.0
+        xb = np.asarray(self.mm[b], dtype=np.float32) / 255.0
+        x = torch.from_numpy(np.concatenate([xa, xb], axis=1))        # (1, 2T, H, W)
+        if self.augment:
+            x = self._aug(x)
+        return x, int(self.label[i]), int(self.fw[i])
 
 
 class PackedData(Dataset, _AugMixin):
@@ -361,6 +450,22 @@ def build_datasets(cfg):
             pids = sorted(man[s].ParticipantID.unique())[:lim]
             man[s] = man[s][man[s].ParticipantID.isin(pids)].reset_index(drop=True)
     res = cfg["pack_res"]
+    if cfg.get("stride_pairs"):
+        # one sample = a left+right stride from an UNMIRRORED pack (keeps gait asymmetry)
+        pw = 1 if lim else 4
+        for s in ("train", "val", "test"):
+            build_pack(s, man[s], res=res, mirror_right=False, workers=pw)
+        dev_p = "memmap" if cfg["pack_device"] == "cuda" else cfg["pack_device"]
+        ds_train = PairedPackedData("train", man["train"], res=res, augment=cfg["augment"],
+                                    device=dev_p, mirror=False)
+        ds_val = PairedPackedData("val", man["val"], res=res, device="memmap", mirror=False)
+        ds_test = PairedPackedData("test", man["test"], res=res, device="memmap", mirror=False)
+        n_val = len(stride_pairs(man["val"].reset_index(drop=True)))
+        keep = np.sort(np.random.default_rng(SEED).choice(
+            n_val, min(cfg["val_monitor"], n_val), replace=False))
+        ds_val_mon = PairedPackedData("val", man["val"], res=res, device="memmap",
+                                      mirror=False, rows=keep)
+        return man, dict(train=ds_train, val=ds_val, test=ds_test, val_mon=ds_val_mon)
     if cfg["use_pack"]:
         pw = 1 if lim else 4             # single worker keeps peak RAM to one float64 cube
         for s in ("train", "val", "test"):

@@ -44,6 +44,28 @@ class MixStyle(nn.Module):
         return xn * (sig * lmda + sig[perm] * (1 - lmda)) + (mu * lmda + mu[perm] * (1 - lmda))
 
 
+class SNR(nn.Module):
+    """Style Normalisation and Restitution (Jin et al., CVPR 2020).
+
+    Plain InstanceNorm removes footwear style but takes identity signal with it -- measured
+    here: IN lifted cross-footwear EER 30.7 -> 29.2 while mixed-gallery rank-1 fell
+    0.644 -> 0.536. SNR fixes exactly that: normalise the style away, then look at what was
+    removed (R = x - IN(x)) and add back only the identity-relevant channels, selected by a
+    small squeeze-excite gate. Style is discarded, discriminative content is restituted."""
+
+    def __init__(self, c, r=8):
+        super().__init__()
+        self.norm = nn.InstanceNorm2d(c, affine=True)
+        hidden = max(4, c // r)
+        self.gate = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(c, hidden, 1),
+                                  nn.ReLU(inplace=True), nn.Conv2d(hidden, c, 1), nn.Sigmoid())
+
+    def forward(self, x):
+        xn = self.norm(x)              # style-normalised
+        r = x - xn                     # what IN threw away (style + some identity)
+        return xn + self.gate(r) * r   # restitute the identity-relevant part only
+
+
 class Embedder(nn.Module):
     """Backbone (-> feat_dim) + BNNeck head: f_t (pre-BN, triplet), f_i (post-BN, ID/cosine)."""
 
@@ -109,25 +131,68 @@ def make_resnet2d_light(embed_dim=128, n_classes=None, in_frames=T):
 
 
 class GaitCNN(nn.Module):
-    """Compact 2D-CNN for the 75x40 map (reference plantar-pressure shape): 4 gentle blocks."""
+    """Compact 2D-CNN for the 75x40 map (reference plantar-pressure shape): 4 gentle blocks.
+    With mixstyle=True, MixStyle is inserted after the first two blocks (early stages only -- never
+    the last, which carries identity): footwear changes the per-channel feature STATISTICS ('style')
+    of the pressure map more than its structure, so mixing instance stats across the batch during
+    training makes the embedding footwear-invariant. Off at eval. (Zhou et al. 2021.)"""
 
-    def __init__(self, in_frames=T, widths=(64, 128, 256, 256)):
+    def __init__(self, in_frames=T, widths=(64, 128, 256, 256), mixstyle=False, norm="bn"):
         super().__init__()
+        # norm="in" swaps BatchNorm for InstanceNorm. BN normalises with batch statistics and so
+        # PRESERVES each sample's own style; IN normalises per-sample per-channel and therefore
+        # REMOVES it. Footwear is carried largely in those per-sample statistics (a stiff sole
+        # spreads load, barefoot concentrates it), so IN is a footwear-invariance mechanism built
+        # into the architecture -- this is what the organisers' own baseline uses (InstanceNorm3d).
+        def nrm(c):
+            return nn.InstanceNorm2d(c, affine=True) if norm == "in" else nn.BatchNorm2d(c)
+
         def blk(cin, cout):
             return nn.Sequential(nn.Conv2d(cin, cout, 3, padding=1, bias=False),
-                                 nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
+                                 nrm(cout), nn.ReLU(inplace=True))
         c0, c1, c2, c3 = widths
+        ms1 = MixStyle() if mixstyle else nn.Identity()      # after stage 1
+        ms2 = MixStyle() if mixstyle else nn.Identity()      # after stage 2
+        # norm="snr": keep BatchNorm inside the blocks (so identity discrimination is intact)
+        # and insert SNR after the early/mid stages, where style lives.
+        s1 = SNR(c0) if norm == "snr" else nn.Identity()
+        s2 = SNR(c1) if norm == "snr" else nn.Identity()
+        s3 = SNR(c2) if norm == "snr" else nn.Identity()
         self.features = nn.Sequential(
-            blk(in_frames, c0), nn.MaxPool2d(2), blk(c0, c1), nn.MaxPool2d(2),
-            blk(c1, c2), nn.MaxPool2d(2), blk(c2, c3), nn.AdaptiveAvgPool2d(1))
+            blk(in_frames, c0), s1, ms1, nn.MaxPool2d(2), blk(c0, c1), s2, ms2, nn.MaxPool2d(2),
+            blk(c1, c2), s3, nn.MaxPool2d(2), blk(c2, c3), nn.AdaptiveAvgPool2d(1))
         self.out_dim = c3
 
     def forward(self, x):
         return self.features(x.squeeze(1)).flatten(1)
 
 
-def make_gaitcnn(embed_dim=128, n_classes=None, in_frames=T):
-    net = GaitCNN(in_frames=in_frames)
+def make_gaitcnn(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False):
+    net = GaitCNN(in_frames=in_frames, mixstyle=mixstyle)
+    return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
+
+
+def make_gaitcnn_in(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False):
+    """GaitCNN with InstanceNorm instead of BatchNorm -- architecture-level footwear-style removal,
+    matching the organisers' baseline (which uses InstanceNorm3d in its SpatioTemporalConv)."""
+    net = GaitCNN(in_frames=in_frames, mixstyle=mixstyle, norm="in")
+    return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
+
+
+def make_gaitcnn_snr(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False):
+    """GaitCNN + SNR modules: InstanceNorm-based style removal with identity restitution.
+    Targets the measured IN trade-off (better cross-footwear EER, worse rank-1)."""
+    net = GaitCNN(in_frames=in_frames, mixstyle=mixstyle, norm="snr")
+    return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
+
+
+def make_gaitcnn_tiny(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False):
+    """Low-capacity GaitCNN (~16x fewer conv params). The full model memorises the training
+    identities within 2-3 epochs (train rank-1 -> 1.00, train cross-footwear EER -> ~1%), after
+    which the loss is satisfied, gradients vanish and validation stops moving. Shrinking capacity
+    keeps the training task non-trivial for longer, forcing features that transfer to new people
+    instead of an identity lookup table."""
+    net = GaitCNN(in_frames=in_frames, widths=(16, 32, 64, 64), mixstyle=mixstyle)
     return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
 
 
@@ -331,10 +396,16 @@ def registry(sample3d, data_t=T):
     # (48,48,48) input (--sample3d 48,48,48) passes through unchanged; the full 101-frame cube is
     # still downsampled (it OOMs 3D convs otherwise).
     clip3d = (min(48, sample3d[0]), min(64, sample3d[1]), min(64, sample3d[2]))
-    return {
+    reg = {
         "gaitcnn":  dict(fn=make_gaitcnn, kw=dict(in_frames=data_t), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "gaitcnn_deep": dict(fn=make_gaitcnn_deep, kw=dict(in_frames=data_t), full_pk=pk2d,
+                             smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "gaitcnn_snr": dict(fn=make_gaitcnn_snr, kw=dict(in_frames=data_t), full_pk=pk2d,
+                            smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "gaitcnn_in": dict(fn=make_gaitcnn_in, kw=dict(in_frames=data_t), full_pk=pk2d,
+                           smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "gaitcnn_tiny": dict(fn=make_gaitcnn_tiny, kw=dict(in_frames=data_t), full_pk=pk2d,
                              smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "convnext": dict(fn=make_convnext, kw=dict(in_frames=data_t), full_pk=(64, 4),
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
@@ -359,3 +430,22 @@ def registry(sample3d, data_t=T):
         "vit":      dict(fn=make_vit, kw=dict(resize=clip3d), full_pk=pk3d,
                          smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
     }
+    # per-model LR factor: heavy nets overfit fast and need a much lower LR than the light 2D CNNs.
+    # Calibrated from the r2plus1d dynamics: val kept climbing while the (warming-up) LR was in the
+    # 3-8e-4 band and only cratered once it crossed ~1.1e-3, so we place the *peak* at ~5e-4 for the
+    # video ResNets (batch 256 -> 1e-3*sqrt(2)*0.35 = 5e-4) -- safely inside the climbing band, well
+    # below the crash. Transformers are even more LR-brittle, so they stay lower.
+    # The sqrt-batch rule alone lands the 2D nets at 2e-3 (batch 512) -- too hot for AdamW here, so
+    # they peaked early and memorized exactly like the 3D nets did: the "every model early-stops"
+    # symptom was one LR bug, not many. Factors below place every model's PEAK LR in the sane
+    # 1.5e-4..8e-4 band regardless of its batch.
+    for n, spec in reg.items():
+        spec["lr_mult"] = 1.0
+    for n in ("gaitcnn", "gaitcnn_in", "gaitcnn_snr", "gaitcnn_deep", "gaitcnn_tiny", "resnet2d", "resnet2d_light", "cnnlstm"):
+        reg[n]["lr_mult"] = 0.4                           # 2D CNNs: 2e-3 -> ~8e-4 at batch 512
+    for n in ("r2plus1d", "r2plus1d_light", "r3d", "r3d_light"):
+        reg[n]["lr_mult"] = 0.35                          # video ResNets: peak ~5e-4 at batch 256
+    for n in ("swin3d", "swin3d_light", "vit"):
+        reg[n]["lr_mult"] = 0.2                           # transformers: gentler still
+    reg["convnext"]["lr_mult"] = 0.5                       # ConvNeXt (28M) also wants a gentler LR
+    return reg

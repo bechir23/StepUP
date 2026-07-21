@@ -37,14 +37,33 @@ def add_common_args(ap):
     d.add_argument("--val-monitor", type=int, default=3000, help="val steps embedded per epoch")
     d.add_argument("--augment", action="store_true", help="training augmentation on")
     d.add_argument("--no-augment", dest="augment", action="store_false")
+    d.add_argument("--stride-pairs", action="store_true",
+                   help="one sample = a left+right stride (consecutive opposite-side footsteps) "
+                        "from an unmirrored pack, concatenated along time. Preserves gait "
+                        "asymmetry and inter-foot timing, which mirroring destroys.")
     d.set_defaults(augment=True, use_pack=True)
 
     l = ap.add_argument_group("loss / mining")
-    l.add_argument("--loss", default="arcface", choices=["arcface", "triplet", "supcon", "ce"],
+    l.add_argument("--loss", default="arcface",
+                   choices=["arcface", "arcfw", "arcadv", "arccal", "circle", "triplet", "supcon", "ce"],
                    help="ID loss. Default single-center ArcFace s=16 on the L2-normed embedding "
-                        "(reference recipe, no triplet). 'supcon' = supervised contrastive (the "
-                        "CodaBench baseline objective). 'ce' = label-smoothed CE + triplet "
-                        "(ablation; caps open-set rank-1 lower).")
+                        "(reference recipe, no triplet). 'arcfw' = ArcFace + cross-footwear triplet "
+                        "on f_t. 'arcadv' = ArcFace + gradient-reversed footwear discriminator on "
+                        "f_i. 'arccal' = ArcFace + cross-footwear center alignment on f_i (directly "
+                        "compresses a person's different-shoe embeddings -- strongest invariance "
+                        "term; use with --mining crossfw). 'supcon'/'ce' = baselines.")
+    l.add_argument("--fw-triplet-weight", type=float, default=1.0,
+                   help="arcfw only: weight on the cross-footwear triplet term")
+    l.add_argument("--adv-weight", type=float, default=1.0,
+                   help="arcadv only: gradient-reversal strength (lambda) for the footwear "
+                        "discriminator; higher = stronger footwear removal")
+    l.add_argument("--cal-weight", type=float, default=0.5,
+                   help="arccal only: weight on the cross-footwear center-alignment term "
+                        "(literature range 0.1-1.0; high values distort the identity embedding)")
+    l.add_argument("--label-smooth", type=float, default=0.0,
+                   help="label smoothing on the ID loss. Gives the loss a finite optimum so it "
+                        "stops widening margins on already-separated training identities "
+                        "(the cause of the peak-then-decay validation curve). Try 0.1-0.2.")
     l.add_argument("--arc-scale", type=float, default=16.0,
                    help="ArcFace scale s (reference uses 16; lower = gentler)")
     l.add_argument("--mining", default="standard", choices=["standard", "crossfw"],
