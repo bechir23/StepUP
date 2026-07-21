@@ -39,7 +39,7 @@ def main():
     cfg = build_cfg(args)
     set_dropout(cfg["dropout"])
     seed_everything()
-    data_t = cfg["pack_res"][0] if cfg["pack_res"] else T
+    data_t = (cfg["sample3d"] or cfg["pack_res"] or (T, H, W))[0]   # what the model actually sees
     if cfg.get("stride_pairs"):
         data_t *= 2                      # a stride = left+right concatenated in time
     reg = registry(cfg["sample3d"], data_t)

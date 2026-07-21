@@ -37,11 +37,12 @@ def add_common_args(ap):
     d.add_argument("--val-monitor", type=int, default=3000, help="val steps embedded per epoch")
     d.add_argument("--augment", action="store_true", help="training augmentation on")
     d.add_argument("--no-augment", dest="augment", action="store_false")
+    d.add_argument("--no-stride-pairs", dest="stride_pairs", action="store_false")
     d.add_argument("--stride-pairs", action="store_true",
                    help="one sample = a left+right stride (consecutive opposite-side footsteps) "
                         "from an unmirrored pack, concatenated along time. Preserves gait "
                         "asymmetry and inter-foot timing, which mirroring destroys.")
-    d.set_defaults(augment=True, use_pack=True)
+    d.set_defaults(augment=True, use_pack=True, stride_pairs=True)
 
     l = ap.add_argument_group("loss / mining")
     l.add_argument("--loss", default="arcface",
@@ -60,16 +61,18 @@ def add_common_args(ap):
     l.add_argument("--cal-weight", type=float, default=0.5,
                    help="arccal only: weight on the cross-footwear center-alignment term "
                         "(literature range 0.1-1.0; high values distort the identity embedding)")
-    l.add_argument("--label-smooth", type=float, default=0.0,
+    l.add_argument("--label-smooth", type=float, default=0.15,
                    help="label smoothing on the ID loss. Gives the loss a finite optimum so it "
                         "stops widening margins on already-separated training identities "
                         "(the cause of the peak-then-decay validation curve). Try 0.1-0.2.")
     l.add_argument("--arc-scale", type=float, default=16.0,
                    help="ArcFace scale s (reference uses 16; lower = gentler)")
-    l.add_argument("--mining", default="standard", choices=["standard", "crossfw"],
+    l.add_argument("--mining", default="crossfw", choices=["standard", "crossfw"],
                    help="triplet mining: batch-hard or cross-footwear positive")
-    l.add_argument("--mixstyle", action="store_true",
-                   help="insert MixStyle in the video ResNets (r2plus1d/r3d) for domain generalization")
+    l.add_argument("--mixstyle", action="store_true", default=True,
+                   help="MixStyle in the backbone: mixes per-sample feature statistics (which carry "
+                        "footwear) across the batch. On by default -- improved every metric.")
+    l.add_argument("--no-mixstyle", dest="mixstyle", action="store_false")
 
     w = ap.add_argument_group("logging")
     w.add_argument("--wandb", default="disabled", choices=["online", "offline", "disabled"])

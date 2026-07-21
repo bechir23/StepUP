@@ -356,6 +356,17 @@ def build_pack(split_name, manifest, res=None, mirror_right=True, overwrite=Fals
     return path
 
 
+def _resize_cube(x, size):
+    """Resize a (1,T,H,W) cube to `size` at load time. This is what lets ONE full-resolution
+    pack serve every experiment: storage resolution (--pack-res) is fixed when the pack is
+    built, while the resolution the model actually sees (--sample3d) stays changeable per run,
+    for 2D backbones as well as 3D ones."""
+    if size is None or tuple(x.shape[-3:]) == tuple(size):
+        return x
+    return F.interpolate(x.unsqueeze(0), size=tuple(size), mode="trilinear",
+                         align_corners=False).squeeze(0)
+
+
 class PairedPackedData(Dataset, _AugMixin):
     """One item = one STRIDE: the left and right footstep of a consecutive pair, concatenated
     along time -> (1, 2T, H, W). Needs an UNMIRRORED pack so left/right asymmetry survives.
@@ -363,7 +374,7 @@ class PairedPackedData(Dataset, _AugMixin):
     is what is needed to raise the ceiling rather than trade one metric for another."""
 
     def __init__(self, split_name, manifest, res=None, augment=False, device="memmap",
-                 rows=None, mirror=False):
+                 rows=None, mirror=False, resize_to=None):
         path = existing_pack_path(split_name, manifest, res, mirror=mirror)
         full = manifest.reset_index(drop=True)
         pairs = stride_pairs(full)
@@ -372,6 +383,7 @@ class PairedPackedData(Dataset, _AugMixin):
         self.pairs = pairs
         self.device = device
         self.augment = augment
+        self.resize_to = resize_to
         self.mm = np.load(path, mmap_mode="r" if device == "memmap" else None)
         assert len(self.mm) == len(full), \
             f"pack has {len(self.mm)} rows but manifest has {len(full)}; rebuild the pack"
@@ -388,6 +400,9 @@ class PairedPackedData(Dataset, _AugMixin):
         xa = np.asarray(self.mm[a], dtype=np.float32) / 255.0
         xb = np.asarray(self.mm[b], dtype=np.float32) / 255.0
         x = torch.from_numpy(np.concatenate([xa, xb], axis=1))        # (1, 2T, H, W)
+        if self.resize_to is not None:                                 # 2T frames -> 2*target T
+            t = self.resize_to
+            x = _resize_cube(x, (t[0] * 2, t[1], t[2]))
         if self.augment:
             x = self._aug(x)
         return x, int(self.label[i]), int(self.fw[i])
@@ -397,7 +412,8 @@ class PackedData(Dataset, _AugMixin):
     """Footsteps from a prebuilt pack read from the artifacts folder. device: cpu (RAM array),
     memmap (paged), or cuda (VRAM-resident, gathered on the GPU). rows selects a subset."""
 
-    def __init__(self, split_name, manifest, res=None, augment=False, device="cpu", rows=None):
+    def __init__(self, split_name, manifest, res=None, augment=False, device="cpu", rows=None,
+                 resize_to=None):
         from .config import dev
         path = existing_pack_path(split_name, manifest, res)   # tagged or legacy untagged pack
         self.device = device
@@ -408,6 +424,7 @@ class PackedData(Dataset, _AugMixin):
         self.label = self.m.ParticipantID.map(self.pid2label).to_numpy()
         self.fw = self.m.Footwear.map(FW2CODE).to_numpy()
         self.augment = augment
+        self.resize_to = resize_to
         if device == "cuda":
             self.pack = torch.from_numpy(np.load(path)).to(dev)
             self.label_t = torch.as_tensor(self.label, device=dev)
@@ -426,6 +443,8 @@ class PackedData(Dataset, _AugMixin):
         idx = np.asarray(idx)
         ii = torch.as_tensor(self.rows[idx], device=dev)
         xb = self.pack[ii].to(torch.float32).div_(255.0)
+        if self.resize_to is not None and tuple(xb.shape[-3:]) != tuple(self.resize_to):
+            xb = F.interpolate(xb, size=tuple(self.resize_to), mode="trilinear", align_corners=False)
         if self.augment:
             xb = torch.stack([self._aug(x) for x in xb])
         jj = torch.as_tensor(idx, device=dev)
@@ -433,6 +452,7 @@ class PackedData(Dataset, _AugMixin):
 
     def __getitem__(self, i):
         x = torch.from_numpy(np.asarray(self.mm[self.rows[i]], dtype=np.float32) / 255.0)
+        x = _resize_cube(x, self.resize_to)
         if self.augment:
             x = self._aug(x)
         return x, int(self.label[i]), int(self.fw[i])
@@ -450,6 +470,13 @@ def build_datasets(cfg):
             pids = sorted(man[s].ParticipantID.unique())[:lim]
             man[s] = man[s][man[s].ParticipantID.isin(pids)].reset_index(drop=True)
     res = cfg["pack_res"]
+    # --pack-res is the STORAGE resolution (fixed when the pack was built). --sample3d is what the
+    # model sees, applied at load time, so one full-resolution pack serves every experiment.
+    stored = tuple(res or (T, H, W))
+    want = tuple(cfg.get("sample3d") or stored)
+    rz = None if want == stored else want
+    if rz:
+        print(f"input resize: pack {stored} -> model {rz}", flush=True)
     if cfg.get("stride_pairs"):
         # one sample = a left+right stride from an UNMIRRORED pack (keeps gait asymmetry)
         pw = 1 if lim else 4
@@ -457,30 +484,33 @@ def build_datasets(cfg):
             build_pack(s, man[s], res=res, mirror_right=False, workers=pw)
         dev_p = "memmap" if cfg["pack_device"] == "cuda" else cfg["pack_device"]
         ds_train = PairedPackedData("train", man["train"], res=res, augment=cfg["augment"],
-                                    device=dev_p, mirror=False)
-        ds_val = PairedPackedData("val", man["val"], res=res, device="memmap", mirror=False)
-        ds_test = PairedPackedData("test", man["test"], res=res, device="memmap", mirror=False)
+                                    device=dev_p, mirror=False, resize_to=rz)
+        ds_val = PairedPackedData("val", man["val"], res=res, device="memmap", mirror=False,
+                                  resize_to=rz)
+        ds_test = PairedPackedData("test", man["test"], res=res, device="memmap", mirror=False,
+                                   resize_to=rz)
         n_val = len(stride_pairs(man["val"].reset_index(drop=True)))
         keep = np.sort(np.random.default_rng(SEED).choice(
             n_val, min(cfg["val_monitor"], n_val), replace=False))
         ds_val_mon = PairedPackedData("val", man["val"], res=res, device="memmap",
-                                      mirror=False, rows=keep)
+                                      mirror=False, rows=keep, resize_to=rz)
         return man, dict(train=ds_train, val=ds_val, test=ds_test, val_mon=ds_val_mon)
     if cfg["use_pack"]:
         pw = 1 if lim else 4             # single worker keeps peak RAM to one float64 cube
         for s in ("train", "val", "test"):
             build_pack(s, man[s], res=res, workers=pw)
         ds_train = PackedData("train", man["train"], res=res, augment=cfg["augment"],
-                              device=cfg["pack_device"])
-        ds_val = PackedData("val", man["val"], res=res, device="memmap")
-        ds_test = PackedData("test", man["test"], res=res, device="memmap")
+                              device=cfg["pack_device"], resize_to=rz)
+        ds_val = PackedData("val", man["val"], res=res, device="memmap", resize_to=rz)
+        ds_test = PackedData("test", man["test"], res=res, device="memmap", resize_to=rz)
         rng = np.random.default_rng(SEED)
         mv = man["val"].reset_index(drop=True)
         keep = []
         for _fw, g in mv.groupby("Footwear"):
             k = max(1, round(cfg["val_monitor"] * len(g) / len(mv)))
             keep += list(rng.choice(g.index.to_numpy(), min(k, len(g)), replace=False))
-        ds_val_mon = PackedData("val", man["val"], res=res, device="memmap", rows=np.sort(keep))
+        ds_val_mon = PackedData("val", man["val"], res=res, device="memmap", rows=np.sort(keep),
+                                resize_to=rz)
     else:
         ds_train = FootstepData(man["train"], augment=cfg["augment"])
         ds_val = ds_test = ds_val_mon = FootstepData(man["val"])
