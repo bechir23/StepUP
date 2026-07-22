@@ -66,6 +66,34 @@ class SNR(nn.Module):
         return xn + self.gate(r) * r   # restitute the identity-relevant part only
 
 
+class SNR3d(nn.Module):
+    """SNR for 5D (video) features -- same idea as SNR, with InstanceNorm3d and a 3D gate, so the
+    video backbones can carry the same footwear-style removal as the 2D ones."""
+
+    def __init__(self, c, r=8):
+        super().__init__()
+        self.norm = nn.InstanceNorm3d(c, affine=True)
+        hidden = max(4, c // r)
+        self.gate = nn.Sequential(nn.AdaptiveAvgPool3d(1), nn.Conv3d(c, hidden, 1),
+                                  nn.ReLU(inplace=True), nn.Conv3d(hidden, c, 1), nn.Sigmoid())
+
+    def forward(self, x):
+        xn = self.norm(x)
+        r = x - xn
+        return xn + self.gate(r) * r
+
+
+def _add_snr(net, chans=(64, 128), three_d=False):
+    """Insert SNR after the first two residual stages of a torchvision-style backbone.
+
+    Early stages only: those carry the per-sample statistics that encode footwear, while the last
+    stage carries identity and is left untouched (normalising there costs discrimination)."""
+    mod = SNR3d if three_d else SNR
+    net.layer1 = nn.Sequential(net.layer1, mod(chans[0]))
+    net.layer2 = nn.Sequential(net.layer2, mod(chans[1]))
+    return net
+
+
 class Embedder(nn.Module):
     """Backbone (-> feat_dim) + BNNeck head: f_t (pre-BN, triplet), f_i (post-BN, ID/cosine)."""
 
@@ -196,6 +224,20 @@ def make_gaitcnn_tiny(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False
     return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
 
 
+def make_resnet2d_snr(embed_dim=128, n_classes=None, in_frames=T):
+    """ResNet-2D with SNR after stages 1-2 -- the same footwear-style removal as gaitcnn_snr, so
+    the backbones can be compared with the invariance mechanism held constant."""
+    net = resnet18(weights=None)
+    net.conv1 = nn.Conv2d(in_frames, 64, 3, stride=1, padding=1, bias=False)
+    net.maxpool = nn.Identity()
+    net.layer4[0].conv1.stride = (1, 1)
+    net.layer4[0].downsample[0].stride = (1, 1)
+    net.fc = nn.Identity()
+    net = _add_snr(net, chans=(64, 128))
+    return Embedder(nn.Sequential(TimeAsChannels(), net), feat_dim=512,
+                    embed_dim=embed_dim, n_classes=n_classes)
+
+
 def make_convnext(embed_dim=128, n_classes=None, in_frames=T):
     """ConvNeXt-Tiny (2D, frames-as-channels) with a small-input stem (stride-2 patchify instead
     of 4) so the 75x40 map isn't over-downsampled. One of the architectures the top teams explored;
@@ -310,6 +352,15 @@ def make_r2plus1d(embed_dim=128, n_classes=None, resize=None, mixstyle=False):
     return _wrap3d(MixStyleVideo(net) if mixstyle else net, resize, embed_dim, n_classes, 512)
 
 
+def make_r2plus1d_snr(embed_dim=128, n_classes=None, resize=None, mixstyle=False):
+    """R(2+1)D with SNR3d after stages 1-2. R(2+1)D is the backbone the strongest published
+    StepUP systems converged on, so this is the like-for-like comparison against gaitcnn_snr."""
+    from torchvision.models.video import r2plus1d_18
+    net = _to_single_channel(r2plus1d_18(weights=None))
+    net = _add_snr(net, chans=(64, 128), three_d=True)
+    return _wrap3d(MixStyleVideo(net) if mixstyle else net, resize, embed_dim, n_classes, 512)
+
+
 def make_r2plus1d_light(embed_dim=128, n_classes=None, resize=None, mixstyle=False):
     """Lighter R(2+1)D: drop the last (heaviest, 512-channel) residual stage -> ~14M params vs
     31M, feature dim 256. Fewer blocks + fewer params memorize the train identities more slowly,
@@ -401,6 +452,8 @@ def registry(sample3d, data_t=T):
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "gaitcnn_deep": dict(fn=make_gaitcnn_deep, kw=dict(in_frames=data_t), full_pk=pk2d,
                              smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "resnet2d_snr": dict(fn=make_resnet2d_snr, kw=dict(in_frames=data_t), full_pk=pk2d,
+                             smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "gaitcnn_snr": dict(fn=make_gaitcnn_snr, kw=dict(in_frames=data_t), full_pk=pk2d,
                             smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "gaitcnn_in": dict(fn=make_gaitcnn_in, kw=dict(in_frames=data_t), full_pk=pk2d,
@@ -417,6 +470,8 @@ def registry(sample3d, data_t=T):
                          smoke_pk=(2, 4), smoke_kw=dict(n_frames=min(16, data_t))),
         "r2plus1d": dict(fn=make_r2plus1d, kw=dict(resize=clip3d), full_pk=pk3d,
                          smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
+        "r2plus1d_snr": dict(fn=make_r2plus1d_snr, kw=dict(resize=clip3d), full_pk=pk3d,
+                             smoke_pk=(2, 4), smoke_kw=dict(resize=(8, 16, 12))),
         "r2plus1d_light": dict(fn=make_r2plus1d_light, kw=dict(resize=clip3d), full_pk=pk3d,
                               smoke_pk=(2, 4), smoke_kw=dict(resize=(16, 32, 24))),
         "r3d":      dict(fn=make_r3d, kw=dict(resize=clip3d), full_pk=pk3d,
@@ -441,9 +496,9 @@ def registry(sample3d, data_t=T):
     # 1.5e-4..8e-4 band regardless of its batch.
     for n, spec in reg.items():
         spec["lr_mult"] = 1.0
-    for n in ("gaitcnn", "gaitcnn_in", "gaitcnn_snr", "gaitcnn_deep", "gaitcnn_tiny", "resnet2d", "resnet2d_light", "cnnlstm"):
+    for n in ("gaitcnn", "gaitcnn_in", "gaitcnn_snr", "resnet2d_snr", "gaitcnn_deep", "gaitcnn_tiny", "resnet2d", "resnet2d_light", "cnnlstm"):
         reg[n]["lr_mult"] = 0.4                           # 2D CNNs: 2e-3 -> ~8e-4 at batch 512
-    for n in ("r2plus1d", "r2plus1d_light", "r3d", "r3d_light"):
+    for n in ("r2plus1d", "r2plus1d_snr", "r2plus1d_light", "r3d", "r3d_light"):
         reg[n]["lr_mult"] = 0.35                          # video ResNets: peak ~5e-4 at batch 256
     for n in ("swin3d", "swin3d_light", "vit"):
         reg[n]["lr_mult"] = 0.2                           # transformers: gentler still
