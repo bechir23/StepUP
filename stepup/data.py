@@ -290,10 +290,21 @@ def pack_path(split_name, res, mirror=True):
     return ARTIFACTS / f"pack_{split_name}_{_res_tag(res)}{suf}_u8.npy"
 
 
+_STRIDE_CACHE = {}
+
+
 def stride_pairs(manifest):
     """Group consecutive opposite-side footsteps into (left, right) stride pairs, following the
     organisers' own loader. A stride carries left/right asymmetry and inter-foot timing -- signal
-    that a single (mirrored) footstep throws away entirely."""
+    that a single (mirrored) footstep throws away entirely.
+
+    Memoised: build_datasets asks for the same split's pairs several times (train, test, and val
+    three times over), and the group-wise scan over ~147k rows is slow enough to dominate startup
+    if it is repeated."""
+    key = (len(manifest), int(manifest.ParticipantID.iloc[0]), int(manifest.ParticipantID.iloc[-1]),
+           int(manifest.FootstepID.iloc[0]), int(manifest.FootstepID.iloc[-1]))
+    if key in _STRIDE_CACHE:
+        return _STRIDE_CACHE[key]
     m = manifest.reset_index(drop=True)
     side = m.Side.to_numpy(); fid = m.FootstepID.to_numpy()
     out = []
@@ -302,7 +313,9 @@ def stride_pairs(manifest):
         for i, j in zip(idx[:-1], idx[1:]):
             if side[i] != side[j] and abs(int(fid[i]) - int(fid[j])) == 1:
                 out.append([i, j] if side[i] == "Left" else [j, i])
-    return np.asarray(out, dtype=np.int64).reshape(-1, 2)
+    pairs = np.asarray(out, dtype=np.int64).reshape(-1, 2)
+    _STRIDE_CACHE[key] = pairs
+    return pairs
 
 
 def _matches(path, n, want):
@@ -410,20 +423,45 @@ class PairedPackedData(Dataset, _AugMixin):
         pairs = stride_pairs(full)
         if rows is not None:                       # subsample strides, not footsteps
             pairs = pairs[np.asarray(rows, dtype=np.int64)]
+        from .config import dev
         self.pairs = pairs
         self.device = device
         self.augment = augment
         self.resize_to = resize_to
-        self.mm = np.load(path, mmap_mode="r" if device == "memmap" else None)
-        assert len(self.mm) == len(full), \
-            f"pack has {len(self.mm)} rows but manifest has {len(full)}; rebuild the pack"
+        raw = np.load(path, mmap_mode="r" if device == "memmap" else None)
+        assert len(raw) == len(full), \
+            f"pack has {len(raw)} rows but manifest has {len(full)}; rebuild the pack"
         self.m = full.iloc[self.pairs[:, 0]].reset_index(drop=True)   # stride labelled by its left step
         self.pid2label = {p: i for i, p in enumerate(sorted(self.m.ParticipantID.unique()))}
         self.label = self.m.ParticipantID.map(self.pid2label).to_numpy()
         self.fw = self.m.Footwear.map(FW2CODE).to_numpy()
+        if device == "cuda":
+            # whole pack resident in VRAM; strides are gathered on the GPU (no host round-trip)
+            self.pack = torch.from_numpy(np.ascontiguousarray(raw)).to(dev)
+            self.pairs_t = torch.as_tensor(self.pairs, device=dev)
+            self.label_t = torch.as_tensor(self.label, device=dev)
+            self.fw_t = torch.as_tensor(self.fw, device=dev)
+        else:
+            self.mm = raw
 
     def __len__(self):
         return len(self.pairs)
+
+    def gather(self, idx):
+        """GPU path: index the VRAM-resident pack and concatenate each left/right pair in time."""
+        from .config import dev
+        jj = torch.as_tensor(np.asarray(idx), device=dev)
+        pr = self.pairs_t[jj]                                        # (B, 2)
+        xb = torch.cat([self.pack[pr[:, 0]], self.pack[pr[:, 1]]], dim=2)   # (B,1,2T,H,W)
+        xb = xb.to(torch.float32).div_(255.0)
+        if self.resize_to is not None:
+            t = self.resize_to
+            if tuple(xb.shape[-3:]) != (t[0] * 2, t[1], t[2]):
+                xb = F.interpolate(xb, size=(t[0] * 2, t[1], t[2]), mode="trilinear",
+                                   align_corners=False)
+        if self.augment:
+            xb = torch.stack([self._aug(x) for x in xb])
+        return xb, self.label_t[jj], self.fw_t[jj]
 
     def __getitem__(self, i):
         a, b = self.pairs[i]
@@ -512,9 +550,10 @@ def build_datasets(cfg):
         pw = 1 if lim else 4
         for s in ("train", "val", "test"):
             build_pack(s, man[s], res=res, mirror_right=False, workers=pw)
-        dev_p = "memmap" if cfg["pack_device"] == "cuda" else cfg["pack_device"]
+        # cuda keeps the whole pack in VRAM and gathers strides there; val/test stay on memmap
+        # so they never compete with the training pack for device memory.
         ds_train = PairedPackedData("train", man["train"], res=res, augment=cfg["augment"],
-                                    device=dev_p, mirror=False, resize_to=rz)
+                                    device=cfg["pack_device"], mirror=False, resize_to=rz)
         ds_val = PairedPackedData("val", man["val"], res=res, device="memmap", mirror=False,
                                   resize_to=rz)
         ds_test = PairedPackedData("test", man["test"], res=res, device="memmap", mirror=False,
