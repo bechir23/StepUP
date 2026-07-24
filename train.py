@@ -64,7 +64,8 @@ def main():
         net, hist, best = train(spec["fn"], man["train"], cfg, tag=name,
                                 max_epochs=cfg["epochs"], patience=cfg["patience"],
                                 steps_per_epoch=steps, P=P, K=K, model_kw=mkw,
-                                ds_tr=ds["train"], ds_va=ds["val_mon"], mining=cfg["mining"],
+                                ds_tr=ds["train"], ds_va=ds["val_mon"],
+                                ds_tr_mon=ds.get("train_mon"), mining=cfg["mining"],
                                 wandb_run=run)
         torch.save(dict(state=best["state"], cfg=cfg, model=name, kw=spec["kw"],
                         val_fitness=best["val"], epoch=best["epoch"]),

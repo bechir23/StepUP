@@ -4,8 +4,108 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from sklearn.metrics import davies_bouldin_score, roc_auc_score, silhouette_score
+
 from .config import FOOTWEAR, FOOTWEAR_LABEL, SEED, dev
 from .metrics import enroll_templates, identification, report_from_scores, verification
+
+
+def _pooled_cross_scores(f, y, fw):
+    """Pool cross-footwear genuine/impostor cosine scores: for each enrol shoe, template each id
+    from that shoe, probe with every OTHER shoe (the hard, generalization-relevant pairs)."""
+    fw = np.asarray(fw)
+    y = y if torch.is_tensor(y) else torch.as_tensor(np.asarray(y))
+    scores, labels = [], []
+    for enrol in FOOTWEAR:
+        g, p = fw == enrol, fw != enrol
+        if g.sum() == 0 or p.sum() == 0:
+            continue
+        templates, ids = enroll_templates(f[g], y[g])
+        sim = (F.normalize(f[p]) @ templates.t()).numpy()
+        gen = (ids[None, :] == y[p][:, None]).numpy()
+        scores.append(sim.ravel()); labels.append(gen.ravel())
+    return np.concatenate(scores), np.concatenate(labels).astype(int)
+
+
+def separability_panel(f, y, fw):
+    """NEW smooth generalization metrics computed from the FULL embedding set (no sampled 15-id
+    gallery), so they are far less per-epoch-noisy than rank-1 / EER:
+      auc      -- cross-footwear verification ROC-AUC (whole curve, not one threshold like EER)
+      dprime   -- (mu_genuine - mu_impostor) / pooled-std: raw separability of the score dists
+      emb_margin -- mean(intra-id cosine to own centroid) - mean(inter-id centroid cosine)
+      silhouette -- cosine silhouette of the identity clustering
+    All are 'higher = better' and read the representation directly, which is what actually
+    over-fits (train->1.0, val->collapse). Cheap: reuses the already-computed embeddings."""
+    y = y if torch.is_tensor(y) else torch.as_tensor(np.asarray(y))
+    s, lab = _pooled_cross_scores(f, y, fw)
+    gen, imp = s[lab == 1], s[lab == 0]
+    dprime = float((gen.mean() - imp.mean()) / np.sqrt(0.5 * (gen.var() + imp.var()) + 1e-12))
+    auc = float(roc_auc_score(lab, s)) if lab.min() != lab.max() else float("nan")
+    fn = F.normalize(f).numpy(); yy = y.numpy()
+    ids = np.unique(yy)
+    cents, intra = [], []
+    for i in ids:
+        v = fn[yy == i]; c = v.mean(0); c = c / (np.linalg.norm(c) + 1e-12)
+        cents.append(c); intra.append(float((v @ c).mean()))
+    cents = np.stack(cents)
+    inter = (cents @ cents.T)[np.triu_indices(len(ids), 1)] if len(ids) > 1 else np.array([0.0])
+    margin = float(np.mean(intra) - float(inter.mean()))
+    try:
+        sil = float(silhouette_score(fn, yy, metric="cosine")) if len(ids) > 1 else float("nan")
+    except Exception:
+        sil = float("nan")
+    return dict(auc=auc, dprime=dprime, emb_margin=margin, silhouette=sil)
+
+
+def representation_metrics(f, y, fw, seed=0):
+    """Research-backed embedding-QUALITY metrics that diagnose memorization vs generalization,
+    computed on the VAL (unseen-id) embeddings each epoch (cheap):
+      alignment  -- Wang&Isola 2020: E||x_i - x_j||^2 over same-id CROSS-FOOTWEAR positive pairs
+                    (lower=better; positives should be close *despite the shoe*). Finite optimum.
+      uniformity -- Wang&Isola 2020: log E exp(-2||x_i - x_j||^2) over random pairs (lower=more
+                    spread on the hypersphere). Finite optimum. Over-separation lowers this while
+                    HURTING alignment -- the trade-off is the memorization signal.
+      fisher     -- trace(between-class scatter)/trace(within-class scatter); separability that
+                    should transfer if it is genuine identity structure, not memorized.
+      erank      -- RankMe (Garrido 2023): effective rank = exp(entropy of normalized singular
+                    values) of the embedding matrix; representation richness, NO labels. Collapse
+                    (memorizing a few directions) drives it down.
+      davies_bouldin -- mean cluster compactness/separation ratio (lower=better)."""
+    y = y if torch.is_tensor(y) else torch.as_tensor(np.asarray(y))
+    fn = F.normalize(f).numpy(); yy = y.numpy(); fw = np.asarray(fw)
+    ids = np.unique(yy)
+    # alignment over same-id cross-footwear positive pairs
+    al = []
+    for i in ids:
+        idx = np.where(yy == i)[0]
+        if len(idx) < 2:
+            continue
+        V = fn[idx]; sim = V @ V.T
+        diff_fw = fw[idx][:, None] != fw[idx][None, :]
+        if diff_fw.any():
+            al.append(float((2 - 2 * sim[diff_fw]).mean()))     # ||a-b||^2 = 2-2cos on the sphere
+    alignment = float(np.mean(al)) if al else float("nan")
+    # uniformity over a random pair sample
+    rng = np.random.default_rng(seed)
+    n = len(fn); m = min(4000, n * (n - 1) // 2)
+    a = rng.integers(0, n, m); b = rng.integers(0, n, m); ok = a != b
+    d2 = 2 - 2 * (fn[a[ok]] * fn[b[ok]]).sum(1)
+    uniformity = float(np.log(np.exp(-2 * d2).mean() + 1e-12))
+    # Fisher discriminant ratio (trace form)
+    mu = fn.mean(0); sw = sb = 0.0
+    for i in ids:
+        v = fn[yy == i]; mc = v.mean(0)
+        sw += ((v - mc) ** 2).sum(); sb += len(v) * ((mc - mu) ** 2).sum()
+    fisher = float(sb / (sw + 1e-12))
+    # RankMe effective rank of the embedding matrix
+    s = np.linalg.svd(fn - fn.mean(0), compute_uv=False)
+    p = s / (s.sum() + 1e-12); erank = float(np.exp(-(p * np.log(p + 1e-12)).sum()))
+    try:
+        db = float(davies_bouldin_score(fn, yy)) if len(ids) > 1 else float("nan")
+    except Exception:
+        db = float("nan")
+    return dict(alignment=alignment, uniformity=uniformity, fisher=fisher,
+                erank=erank, davies_bouldin=db)
 
 
 @torch.no_grad()
@@ -194,6 +294,11 @@ def summarise(df):
         if len(sub):
             out[f"{kind}_rank1"] = float(np.nanmean(sub.rank1))
             out[f"{kind}_eer"] = float(np.nanmean(sub.eer))
+            # impactful identification metrics already computed per shoe-pair but previously
+            # discarded: mAP (full-ranking quality) and TAR@1%FAR (deployment gate accept rate).
+            out[f"{kind}_map"] = float(np.nanmean(sub.mAP))
+            out[f"{kind}_rank5"] = float(np.nanmean(sub.rank5))
+            out[f"{kind}_tar1"] = float(np.nanmean(sub.tar1))
     return out
 
 

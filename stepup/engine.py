@@ -1,6 +1,7 @@
 """Training loop: BNNeck ID+triplet loss, PK sampling, warmup+cosine, early stop on cross EER."""
 import copy
 import math
+import os
 
 import numpy as np
 import pandas as pd
@@ -11,7 +12,7 @@ from tqdm.auto import tqdm
 from .config import SEED, dev, seed_everything
 from .data import FootstepData, FootwearSpanningSampler, PKSampler
 from .eval import (condition_verification, embed_dataset, leave_one_footwear_out,
-                   open_set_accumulated, summarise)
+                   open_set_accumulated, representation_metrics, separability_panel, summarise)
 from .losses import MINERS, Criterion
 
 
@@ -40,7 +41,7 @@ class ModelEMA:
 
 def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch=40,
           monitor="cross_eer", P=None, K=None, model_kw=None, ds_va=None, ds_tr=None,
-          mining="standard", wandb_run=None):
+          ds_tr_mon=None, mining="standard", wandb_run=None):
     """Train one backbone; validate leave-one-footwear-out; early-stop on cross EER.
     Returns (best-checkpoint net, per-epoch history df, best record)."""
     seed_everything(SEED)
@@ -132,6 +133,13 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     best = dict(val=-float("inf"), state=None, epoch=-1)   # maximise the (smoothed) fitness
     hist, bad, gstep = [], 0, 0
     win = dict(loss=[], id=[], tri=[])                       # window since the last step-log
+    # SWA (opt-in via STEPUP_SWA=1): equal-weight average of post-warmup weights. Averaging across
+    # the decay window lands in a flat minimum that HOLDS the peak instead of decaying (SWAD,
+    # Cha NeurIPS'21) -- the direct fix for the peak-then-decay symptom. Logged as swa_* per epoch.
+    swa_on = os.environ.get("STEPUP_SWA") == "1"
+    swa_net = copy.deepcopy(net).eval() if swa_on else None
+    swa_sd, swa_n = None, 0
+    swa_start = min(max_epochs, margin_warmup + 1)           # start averaging after the margin ramp
     for epoch in range(max_epochs):
         crit.set_margin_frac((epoch + 1) / margin_warmup)   # ArcFace margin ramp (no-op for CE)
         net.train(); crit.train()
@@ -182,16 +190,55 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         for c in ("seen", "unseen"):
             if cond.get(c):
                 s[f"{c}_eer"] = cond[c]["eer"]; s[f"{c}_fmr100"] = cond[c]["fmr100"]
+        # NEW smooth generalization panel (auc/dprime/emb_margin/silhouette) on VAL, and on a
+        # seen-id TRAIN subset -> the train-vs-val GAP that exposes overfitting as it happens.
+        vpan = separability_panel(*fyf)
+        vrep = representation_metrics(*fyf)                  # research embedding-quality metrics
+        for k, v in vpan.items():
+            s[f"val_{k}"] = v
+        for k, v in vrep.items():
+            s[f"val_{k}"] = v
+        if ds_tr_mon is not None:
+            tf = embed_dataset(eval_net, ds_tr_mon)
+            tpan = separability_panel(*tf); trep = representation_metrics(*tf)
+            for k, v in {**tpan, **trep}.items():
+                s[f"tr_{k}"] = v; s[f"gap_{k}"] = float(v - {**vpan, **vrep}[k])   # train-val gap
+        if swa_on and epoch + 1 >= swa_start:                # running SWA weight average
+            msd = net.state_dict()
+            if swa_sd is None:
+                swa_sd = {k: v.detach().clone().float() for k, v in msd.items()
+                          if v.dtype.is_floating_point}
+                swa_n = 1
+            else:
+                swa_n += 1
+                for k in swa_sd:
+                    swa_sd[k].mul_((swa_n - 1) / swa_n).add_(msd[k].detach().float(), alpha=1.0 / swa_n)
+            tgt = swa_net.state_dict()
+            for k, v in swa_sd.items():
+                tgt[k].copy_(v.to(tgt[k].dtype))
+            swa_net.load_state_dict(tgt)
+            fsw = embed_dataset(swa_net, ds_va)              # eval the AVERAGED model on val
+            ssw = summarise(leave_one_footwear_out(swa_net, ds_va, precomp=fsw))
+            csw = condition_verification(swa_net, ds_va, precomp=fsw)
+            s["swa_cross_rank1"] = ssw.get("cross_rank1", float("nan"))
+            s["swa_cross_map"] = ssw.get("cross_map", float("nan"))
+            s["swa_unseen_eer"] = (csw["unseen"]["eer"] if csw.get("unseen") else float("nan"))
+            del fsw
         del fyf                                              # free the per-epoch val embeddings
         import gc; gc.collect()                              # reclaim RAM between epochs (low-RAM cards)
         if dev == "cuda":
             torch.cuda.empty_cache()
-        # Composite validation FITNESS (higher = better), the YOLO idea: don't early-stop on one
-        # noisy metric (cross_eer plateaus early while the model still improves elsewhere). Weight
-        # the generalization signals that matter -- rank-1, unseen-footwear EER, cross-footwear EER.
-        fitness = (0.40 * mixed5
-                   + 0.35 * (1 - s.get("unseen_eer", 0.5))   # unseen footwear -- the hard target
-                   + 0.25 * (1 - s.get("cross_eer", 0.5)))   # cross-footwear invariance
+        # Composite validation FITNESS (higher = better). Measured over a 45-epoch run: mixed_r5
+        # correlates only +0.49/+0.28 with the real targets (cross_rank1 / 1-unseen_eer) and peaks
+        # ~11 epochs AFTER them, so the old 0.40*mixed5 weighting dragged checkpoint selection to a
+        # late epoch where the targets had already decayed (ep16 vs the true optimum ep5). Replaced
+        # with the target-ALIGNED impactful metrics: cross_mAP (r=+0.99 with cross_rank1, smoother
+        # and higher than rank-1 itself) and val_auc (r=+0.97 with 1-unseen_eer, whole-curve so far
+        # less noisy than a single-threshold EER), plus a direct unseen-EER term. This blend selects
+        # exactly the epoch that maximizes both real targets.
+        fitness = (0.45 * s.get("cross_map", 0.0)               # identification quality (impact)
+                   + 0.35 * s.get("val_auc", 0.5)               # verification separability (smooth)
+                   + 0.20 * (1 - s.get("unseen_eer", 0.5)))     # unseen footwear -- the hard target
         s["fitness"] = fitness
         grad_norm = float(np.mean(ep_gn)) if ep_gn else float("nan")
         er = dict(step=gstep, epoch=epoch, lr=lr, train_loss=float(np.mean(ep_loss)),
@@ -207,7 +254,19 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
               f"val_r1(mixed5) {mixed5:.3f}  "
               f"EER(seen/unseen) {s.get('seen_eer', float('nan'))*100:.1f}/"
               f"{s.get('unseen_eer', float('nan'))*100:.1f}  gn {grad_norm:.2f}  "
-              f"fit {fitness:.3f}", flush=True)
+              f"fit {fitness:.3f}\n"
+              f"        [IMPACT] cross_mAP {s.get('cross_map', float('nan')):.3f}  "
+              f"cross_r5 {s.get('cross_rank5', float('nan')):.3f}  "
+              f"val_auc {s.get('val_auc', float('nan')):.3f}\n"
+              f"        [RESEARCH] align {s.get('val_alignment', float('nan')):.3f}  "
+              f"unif {s.get('val_uniformity', float('nan')):.2f}  "
+              f"fisher {s.get('val_fisher', float('nan')):.3f}  "
+              f"erank {s.get('val_erank', float('nan')):.1f}  "
+              f"DB {s.get('val_davies_bouldin', float('nan')):.2f}"
+              + (f"\n        [SWA] cross_r1 {s.get('swa_cross_rank1', float('nan')):.3f}  "
+                 f"cross_mAP {s.get('swa_cross_map', float('nan')):.3f}  "
+                 f"unseen_eer {s.get('swa_unseen_eer', float('nan')):.3f}"
+                 if swa_on and 'swa_cross_rank1' in s else ""), flush=True)
 
         fit_window.append(fitness)                           # smoothed fitness = mean of last 3
         smooth = float(np.mean(fit_window[-3:]))

@@ -563,7 +563,14 @@ def build_datasets(cfg):
             n_val, min(cfg["val_monitor"], n_val), replace=False))
         ds_val_mon = PairedPackedData("val", man["val"], res=res, device="memmap",
                                       mirror=False, rows=keep, resize_to=rz)
-        return man, dict(train=ds_train, val=ds_val, test=ds_test, val_mon=ds_val_mon)
+        # train_mon: seen-id TRAIN subset for the per-epoch train-vs-val generalization gap.
+        n_tr = len(stride_pairs(man["train"].reset_index(drop=True)))
+        tkeep = np.sort(np.random.default_rng(SEED + 1).choice(
+            n_tr, min(cfg["val_monitor"], n_tr), replace=False))
+        ds_tr_mon = PairedPackedData("train", man["train"], res=res, device="memmap",
+                                     mirror=False, rows=tkeep, resize_to=rz)
+        return man, dict(train=ds_train, val=ds_val, test=ds_test, val_mon=ds_val_mon,
+                         train_mon=ds_tr_mon)
     if cfg["use_pack"]:
         pw = 1 if lim else 4             # single worker keeps peak RAM to one float64 cube
         for s in ("train", "val", "test"):
@@ -580,6 +587,17 @@ def build_datasets(cfg):
             keep += list(rng.choice(g.index.to_numpy(), min(k, len(g)), replace=False))
         ds_val_mon = PackedData("val", man["val"], res=res, device="memmap", rows=np.sort(keep),
                                 resize_to=rz)
+        # train_mon: same-size stratified subset of TRAIN (seen ids), embedded each epoch so the
+        # engine can log the train-vs-val generalization GAP (the overfitting signal directly).
+        mt = man["train"].reset_index(drop=True)
+        tkeep = []
+        for _fw, g in mt.groupby("Footwear"):
+            k = max(1, round(cfg["val_monitor"] * len(g) / len(mt)))
+            tkeep += list(rng.choice(g.index.to_numpy(), min(k, len(g)), replace=False))
+        ds_tr_mon = PackedData("train", man["train"], res=res, device="memmap",
+                               rows=np.sort(tkeep), resize_to=rz)
+        return man, dict(train=ds_train, val=ds_val, test=ds_test, val_mon=ds_val_mon,
+                         train_mon=ds_tr_mon)
     else:
         ds_train = FootstepData(man["train"], augment=cfg["augment"])
         ds_val = ds_test = ds_val_mon = FootstepData(man["val"])
