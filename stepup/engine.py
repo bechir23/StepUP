@@ -255,18 +255,14 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
               f"EER(seen/unseen) {s.get('seen_eer', float('nan'))*100:.1f}/"
               f"{s.get('unseen_eer', float('nan'))*100:.1f}  gn {grad_norm:.2f}  "
               f"fit {fitness:.3f}\n"
-              f"        [IMPACT] cross_mAP {s.get('cross_map', float('nan')):.3f}  "
+              f"        cross_mAP {s.get('cross_map', float('nan')):.3f}  "
               f"cross_r5 {s.get('cross_rank5', float('nan')):.3f}  "
-              f"val_auc {s.get('val_auc', float('nan')):.3f}\n"
-              f"        [RESEARCH] align {s.get('val_alignment', float('nan')):.3f}  "
+              f"val_auc {s.get('val_auc', float('nan')):.3f}  "
+              f"align {s.get('val_alignment', float('nan')):.3f}  "
               f"unif {s.get('val_uniformity', float('nan')):.2f}  "
               f"fisher {s.get('val_fisher', float('nan')):.3f}  "
               f"erank {s.get('val_erank', float('nan')):.1f}  "
-              f"DB {s.get('val_davies_bouldin', float('nan')):.2f}"
-              + (f"\n        [SWA] cross_r1 {s.get('swa_cross_rank1', float('nan')):.3f}  "
-                 f"cross_mAP {s.get('swa_cross_map', float('nan')):.3f}  "
-                 f"unseen_eer {s.get('swa_unseen_eer', float('nan')):.3f}"
-                 if swa_on and 'swa_cross_rank1' in s else ""), flush=True)
+              f"DB {s.get('val_davies_bouldin', float('nan')):.2f}", flush=True)
 
         fit_window.append(fitness)                           # smoothed fitness = mean of last 3
         smooth = float(np.mean(fit_window[-3:]))
