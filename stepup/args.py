@@ -21,6 +21,9 @@ def add_common_args(ap):
                    help="ArcFace only: ramp the angular margin 0->target over this fraction of "
                         "epochs (prevents early embedding collapse)")
     g.add_argument("--dropout", type=float, default=0.2)
+    g.add_argument("--swa", action="store_true",
+                   help="Stochastic Weight Averaging: average post-warmup weights and eval that "
+                        "flat-minimum model (swa_* metrics) -- holds the peak, kills the decay")
     g.add_argument("--embed-dim", type=int, default=128)
     g.add_argument("--workers", type=int, default=8, help="DataLoader workers (Colab has cores)")
     g.add_argument("--log-every", type=int, default=0,

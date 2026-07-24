@@ -136,7 +136,7 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     # SWA (opt-in via STEPUP_SWA=1): equal-weight average of post-warmup weights. Averaging across
     # the decay window lands in a flat minimum that HOLDS the peak instead of decaying (SWAD,
     # Cha NeurIPS'21) -- the direct fix for the peak-then-decay symptom. Logged as swa_* per epoch.
-    swa_on = os.environ.get("STEPUP_SWA") == "1"
+    swa_on = cfg.get("swa", False) or os.environ.get("STEPUP_SWA") == "1"   # --swa flag OR env var
     swa_net = copy.deepcopy(net).eval() if swa_on else None
     swa_sd, swa_n = None, 0
     swa_start = min(max_epochs, margin_warmup + 1)           # start averaging after the margin ramp

@@ -98,4 +98,5 @@ def build_cfg(args):
         patience=args.patience, steps_per_epoch=args.steps_per_epoch,
         limit_ids=getattr(args, "limit_ids", 0), log_every=getattr(args, "log_every", 100),
         margin_warmup_frac=getattr(args, "margin_warmup_frac", 0.1),
+        swa=getattr(args, "swa", False),
     )
