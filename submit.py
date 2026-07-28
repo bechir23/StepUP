@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--model", default="gaitcnn_snr")
     ap.add_argument("--in-frames", type=int, default=0, help="override backbone in_frames if the auto value mismatches the checkpoint")
     ap.add_argument("--tag", default="", help="load {model}_{tag}_best.pt (a specific ablation run)")
+    ap.add_argument("--pack-device", default="", choices=["", "cuda", "memmap", "cpu"], help="override the checkpoint's pack device (cuda = fast eval on Colab)")
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--hf-repo", default=None); ap.add_argument("--hf-token", default=None)
     ap.add_argument("--score-norm", default="znorm", choices=["none", "znorm"])
@@ -79,6 +80,8 @@ def main():
                       config=vars(args))
 
     net, cfg = load_backbone(args.model, args.ckpt, args.hf_repo, args.hf_token, args.in_frames, args.tag)
+    if args.pack_device:
+        cfg["pack_device"] = args.pack_device   # override (cuda = fast on Colab, memmap = low RAM)
     _, ds = build_datasets(cfg)
     f, y, fw = embed_dataset(net, ds["test"])
     print(f"embedded test: {len(f)} steps, {len(np.unique(y.numpy()))} ids", flush=True)
