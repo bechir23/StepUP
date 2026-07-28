@@ -21,6 +21,19 @@ FOOTWEAR_LABEL = {"BF": "barefoot/sock", "ST": "standard shoe",
                   "P1": "personal shoe 1", "P2": "personal shoe 2"}
 SPEEDS = ["W1", "W2", "W3", "W4"]
 
+# ---- shared CLI defaults (ONE source of truth so a flag means the same thing in every stage) ----
+# Import these in train/args, aggregate, submit; never hard-code the number in a script again.
+DEF_LR = 1e-3            # AdamW LR                       (train, aggregate)
+DEF_WD = 1e-2            # AdamW weight decay             (train, aggregate)
+DEF_M = 4               # samples per identity in a batch (train --K fallback, aggregate --M)
+DEF_HEAD_P = 32          # identities per batch for the frozen-backbone head stages (aggregate --P)
+#   note: train --P/--K default to 0 = the model's own full_pk (per-model auto), a deliberately
+#   different mechanism -- each train sample is ONE stride, each head sample is a k-step WALK
+#   (k x the memory), so the head batch holds fewer identities. This is the one that CANNOT match.
+DEF_WALK_K = 5           # footsteps aggregated per walk  (aggregate --k, submit --k)
+DEF_SUB_CENTERS = 3      # Sub-center ArcFace sub-centres (aggregate --sub-centers)
+DEF_KS = "1,3,5,10"      # accumulated-rank k-curve to report (aggregate --ks, evaluate --ks)
+
 
 def find_root():
     if os.environ.get("STEPUP_ROOT"):

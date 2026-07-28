@@ -20,10 +20,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_metric_learning import losses
 
-from stepup.config import ARTIFACTS, FOOTWEAR, T, dev
+from stepup.config import (ARTIFACTS, DEF_HEAD_P, DEF_KS, DEF_LR, DEF_M, DEF_SUB_CENTERS,
+                           DEF_WALK_K, DEF_WD, FOOTWEAR, T, dev)
 from stepup.data import build_datasets
 from stepup.eval import embed_dataset
-from stepup.metrics import enroll_templates
+from stepup.metrics import enroll_templates, report_from_scores
 from stepup.models import registry, set_dropout
 
 
@@ -135,7 +136,13 @@ def walk_windows(m, k):
 
 
 # ---------------- training the aggregator ----------------
-def train_aggregator(agg, f, m, k, ids, id2c, epochs, P, M, lr, wd, sub_centers):
+def train_aggregator(agg, f, m, fva, mva, k, ids, id2c, epochs, P, M, lr, wd, sub_centers,
+                     patience=8, wb=None):
+    """Train the aggregator, and EVERY epoch evaluate it on a held-out VAL set of unseen identities
+    (same discipline as Stage 1): report identification rank-1 + verification EER / AUC for the
+    LEARNED aggregator vs the frozen MEAN-pool baseline, keep the BEST epoch by val rank-1, and
+    early-stop on patience -- so we never ship the over-trained last epoch (low loss != best eval)."""
+    import copy
     pools = {i: np.where(m.ParticipantID.to_numpy() == i)[0] for i in ids}
     loss_fn = losses.SubCenterArcFaceLoss(num_classes=len(ids), embedding_size=f.shape[1],
                                           sub_centers=sub_centers).to(dev)
@@ -143,6 +150,17 @@ def train_aggregator(agg, f, m, k, ids, id2c, epochs, P, M, lr, wd, sub_centers)
                             weight_decay=wd)
     rng = np.random.default_rng(0)
     steps = max(1, sum(len(v) for v in pools.values()) // (P * M * k))
+
+    # VAL windows + the MEAN-pool baseline are fixed (frozen backbone) -> compute once.
+    vwin = walk_windows(mva, k)
+    em_mean_v, lab_v, fw_v = build_walk_embeds(fva, vwin, agg=None)
+    base = walk_metrics(em_mean_v, lab_v, fw_v)
+    print(f"  val: {len(vwin)} walks (k={k})  |  MEAN baseline  rank1 {base['rank1']:.3f} "
+          f"rank5 {base['rank5']:.3f} EER {base['eer']:.3f} TAR@1% {base['tar1']:.3f} "
+          f"auc {base['auc']:.3f} aupr {base['aupr']:.3f}", flush=True)
+
+    best = dict(val=-float("inf"), state=copy.deepcopy(agg.state_dict()), epoch=-1, m=base)
+    bad = 0
     for ep in range(epochs):
         agg.train(); tot = 0.0
         for _ in range(steps):
@@ -156,9 +174,42 @@ def train_aggregator(agg, f, m, k, ids, id2c, epochs, P, M, lr, wd, sub_centers)
             w = agg(xb)
             loss = loss_fn(w, torch.tensor(by, device=dev))
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item()
-        print(f"  agg ep {ep + 1:>2}/{epochs}  loss {tot / steps:6.3f}", flush=True)
-    agg.eval()
-    return agg
+        train_loss = tot / steps
+
+        agg.eval()                                                          # per-epoch VAL eval
+        em_lrn_v, _, _ = build_walk_embeds(fva, vwin, agg=agg)
+        vm = walk_metrics(em_lrn_v, lab_v, fw_v)
+        fitness = vm["rank1"]                                               # deployment metric = maximise
+        delta = vm["rank1"] - base["rank1"]                                 # learned vs MEAN baseline
+        is_best = fitness > best["val"] + 1e-4
+        print(f"  agg ep {ep + 1:>2}/{epochs}  loss {train_loss:6.3f}  "
+              f"val rank1 {vm['rank1']:.3f} rank5 {vm['rank5']:.3f} EER {vm['eer']:.3f} "
+              f"TAR@1% {vm['tar1']:.3f} auc {vm['auc']:.3f}  "
+              f"| mean {base['rank1']:.3f}  d {delta:+.3f}  fit {fitness:.3f}"
+              f"{'  *' if is_best else ''}", flush=True)
+        if wb is not None:
+            wb.log({"epoch": ep + 1, "agg_loss": train_loss,
+                    "val_rank1": vm["rank1"], "val_rank5": vm["rank5"], "val_eer": vm["eer"],
+                    "val_fmr100": vm["fmr100"], "val_tar1": vm["tar1"], "val_auc": vm["auc"],
+                    "val_aupr": vm["aupr"], "mean_rank1": base["rank1"],
+                    "delta_vs_mean": delta, "fitness": fitness})
+        if is_best:
+            best.update(val=fitness, state=copy.deepcopy(agg.state_dict()), epoch=ep + 1, m=vm)
+            bad = 0
+        else:
+            bad += 1
+            if patience and bad >= patience:
+                print(f"  early stop: no val improvement in {bad} epochs "
+                      f"(best rank1 {best['val']:.3f} @ ep {best['epoch']})", flush=True)
+                break
+
+    agg.load_state_dict(best["state"]); agg.eval()                          # restore the BEST epoch
+    bm = best["m"]
+    print(f"  best epoch {best['epoch']}  val: rank1 {bm['rank1']:.3f} rank5 {bm['rank5']:.3f} "
+          f"EER {bm['eer']:.3f} FMR100 {bm['fmr100']:.3f} TAR@1% {bm['tar1']:.3f} "
+          f"auc {bm['auc']:.3f} aupr {bm['aupr']:.3f}  "
+          f"(mean rank1 {base['rank1']:.3f}, d {bm['rank1'] - base['rank1']:+.3f})", flush=True)
+    return agg, best
 
 
 # ---------------- evaluation: learned vs mean pooling ----------------
@@ -189,6 +240,52 @@ def cross_fw_rank1(embs, labs, fws):
     return float(np.mean(accs)) if accs else float("nan")
 
 
+def walk_metrics(embs, labs, fws):
+    """The full walk-level metric set used by the Stage-2 reference aggregators, so LEARNED vs MEAN
+    pooling is compared on THEIR own axes:
+      Rank-1 / Rank-5  -- NAN's Rank-N identification (Yang CVPR'17), GaitSet's Rank-1 (Chao AAAI'19)
+      TAR@1%FAR        -- NAN's headline TAR@FAR verification metric
+      EER / FMR100     -- the StepUP competition's primary + secondary metrics
+      ROC-AUC / AUPR   -- the Set-Transformer's AUROC/AUPR set metrics (Lee ICML'19)
+    (mAP is omitted here: templates are pooled to one-per-identity, so per-query mAP degenerates to
+    MRR -- mAP stays a Stage-1 step-level metric.)"""
+    from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
+    y = torch.tensor(labs); fws = np.asarray(fws)
+    r1s, r5s, all_s, all_lab = [], [], [], []
+    for enrol in FOOTWEAR:
+        g, p = fws == enrol, fws != enrol
+        if g.sum() == 0 or p.sum() == 0:
+            continue
+        templ, ids = enroll_templates(embs[g], y[g])
+        sim = F.normalize(embs[p]) @ templ.t()                      # (n_probe, n_templates)
+        yp = y[p]
+        ranked = ids[sim.argsort(1, descending=True)]               # templates by score, per probe
+        match = (ranked == yp[:, None])
+        r1s.append(match[:, :1].any(1).float().mean().item())
+        r5s.append(match[:, :min(5, match.shape[1])].any(1).float().mean().item())
+        gen = (ids[None, :] == yp[:, None]).numpy()
+        all_s.append(sim.numpy().ravel()); all_lab.append(gen.ravel().astype(int))
+    keys = ("rank1", "rank5", "eer", "fmr100", "tar1", "auc", "aupr")
+    if not r1s:
+        return {k: float("nan") for k in keys}
+    s, lab = np.concatenate(all_s), np.concatenate(all_lab)
+    rep = report_from_scores(s, lab)
+    try:
+        fpr, tpr, _ = roc_curve(lab, s); tar1 = float(np.interp(0.01, fpr, tpr))   # TAR @ 1% FAR
+    except Exception:
+        tar1 = float("nan")
+    try:
+        auc = float(roc_auc_score(lab, s))
+    except Exception:
+        auc = float("nan")
+    try:
+        aupr = float(average_precision_score(lab, s))
+    except Exception:
+        aupr = float("nan")
+    return {"rank1": float(np.mean(r1s)), "rank5": float(np.mean(r5s)),
+            "eer": rep["eer"], "fmr100": rep["fmr100"], "tar1": tar1, "auc": auc, "aupr": aupr}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -198,12 +295,14 @@ def main():
     ap.add_argument("--pack-device", default="", choices=["", "cuda", "memmap", "cpu"], help="override the checkpoint's pack device (cuda = fast eval on Colab)")
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--hf-repo", default=None); ap.add_argument("--hf-token", default=None)
-    ap.add_argument("--k", type=int, default=5, help="steps per walk the aggregator is trained on")
-    ap.add_argument("--ks", default="1,3,5,10", help="k-curve to report")
-    ap.add_argument("--sub-centers", type=int, default=3)
+    ap.add_argument("--k", type=int, default=DEF_WALK_K, help="steps per walk the aggregator is trained on")
+    ap.add_argument("--ks", default=DEF_KS, help="k-curve to report")
+    ap.add_argument("--sub-centers", type=int, default=DEF_SUB_CENTERS)
     ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--P", type=int, default=32); ap.add_argument("--M", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=1e-3); ap.add_argument("--weight-decay", type=float, default=1e-2)
+    ap.add_argument("--patience", type=int, default=8,
+                    help="early-stop patience on the val rank-1 (0 = train all epochs)")
+    ap.add_argument("--P", type=int, default=DEF_HEAD_P); ap.add_argument("--M", type=int, default=DEF_M)
+    ap.add_argument("--lr", type=float, default=DEF_LR); ap.add_argument("--weight-decay", type=float, default=DEF_WD)
     ap.add_argument("--aggregator", default="pma", choices=["pma", "nan"],
                     help="pma = Set-Transformer (ours); nan = Neural Aggregation Network head")
     ap.add_argument("--wandb", default="disabled", choices=["disabled", "online", "offline"])
@@ -211,38 +310,65 @@ def main():
     wb = None
     if args.wandb != "disabled":
         import wandb as _wb
-        wb = _wb.init(project="stepup-footstep", name=f"agg_{args.aggregator}_K{args.sub_centers}",
-                      mode=args.wandb, config=vars(args))
+        rname = f"agg_{args.model}_{args.aggregator}_K{args.sub_centers}" + (f"_{args.tag}" if args.tag else "")
+        wb = _wb.init(project="stepup-footstep", name=rname, mode=args.wandb, config=vars(args))
 
     net, cfg = load_backbone(args.model, args.ckpt, args.hf_repo, args.hf_token, args.in_frames, args.tag)
     if args.pack_device:
         cfg["pack_device"] = args.pack_device   # override (cuda = fast on Colab, memmap = low RAM)
     _, ds = build_datasets(cfg)
     ftr, mtr = frozen(net, ds["train"])
-    fte, mte = frozen(net, ds["test"])
+    fva, mva = frozen(net, ds["val_mon"])                # held-out VAL ids (unseen): per-epoch selection
+    fte, mte = frozen(net, ds["test"])                   # held-out TEST ids (unseen): final report only
     D = ftr.shape[1]
-    print(f"backbone loaded: embed_dim={D}  train steps={len(mtr)}  test steps={len(mte)}", flush=True)
+    print(f"backbone loaded: embed_dim={D}  train steps={len(mtr)}  val steps={len(mva)}  "
+          f"test steps={len(mte)}", flush=True)
 
     ids = sorted(mtr.ParticipantID.unique()); id2c = {i: c for c, i in enumerate(ids)}
     agg = make_aggregator(args.aggregator, D).to(dev)
     print(f"training aggregator={args.aggregator.upper()} + Sub-Center ArcFace (K={args.sub_centers}) "
           f"on frozen {D}-d embeddings, k={args.k} ...", flush=True)
-    train_aggregator(agg, ftr, mtr, args.k, ids, id2c, args.epochs, args.P, args.M,
-                     args.lr, args.weight_decay, args.sub_centers)
+    agg, best = train_aggregator(agg, ftr, mtr, fva, mva, args.k, ids, id2c, args.epochs,
+                                 args.P, args.M, args.lr, args.weight_decay, args.sub_centers,
+                                 patience=args.patience, wb=wb)
 
-    print(f"\ncross-footwear (hard) accumulated rank-1  --  MEAN vs LEARNED ({args.aggregator}):", flush=True)
+    # final report on the UNSEEN test ids, using the BEST-epoch aggregator (not the last)
+    # (a) full reference-metric table at the training k -- the axes NAN / Set-Transformer report
+    twin = walk_windows(mte, args.k)
+    em_mean_t, lab_t, fw_t = build_walk_embeds(fte, twin, agg=None)
+    em_lrn_t, _, _ = build_walk_embeds(fte, twin, agg=agg)
+    tm_mean = walk_metrics(em_mean_t, lab_t, fw_t)
+    tm_lrn = walk_metrics(em_lrn_t, lab_t, fw_t)
+    print(f"\nTEST walk metrics (k={args.k}, best epoch {best['epoch']})  MEAN vs LEARNED "
+          f"({args.aggregator}):", flush=True)
+    for name, mm in (("mean   ", tm_mean), ("learned", tm_lrn)):
+        print(f"  {name}  rank1 {mm['rank1']:.3f} rank5 {mm['rank5']:.3f} EER {mm['eer']:.3f} "
+              f"FMR100 {mm['fmr100']:.3f} TAR@1% {mm['tar1']:.3f} auc {mm['auc']:.3f} "
+              f"aupr {mm['aupr']:.3f}", flush=True)
+    if wb is not None:
+        wb.log({**{f"test_mean_{k}": v for k, v in tm_mean.items()},
+                **{f"test_learned_{k}": v for k, v in tm_lrn.items()}})
+
+    # (b) accumulated rank-1 k-curve -- the deployment "short walk" headline
+    print(f"\ncross-footwear (hard) accumulated rank-1  --  MEAN vs LEARNED ({args.aggregator}) "
+          f"[TEST, best epoch {best['epoch']}]:", flush=True)
+    kcurve = {}
     for k in (int(v) for v in args.ks.split(",")):
         win = walk_windows(mte, k)
         em_mean, lab, fw = build_walk_embeds(fte, win, agg=None)
         em_lrn, _, _ = build_walk_embeds(fte, win, agg=agg)
         r_mean, r_lrn = cross_fw_rank1(em_mean, lab, fw), cross_fw_rank1(em_lrn, lab, fw)
+        kcurve[k] = (r_mean, r_lrn)
         print(f"  {k:>2}-step   mean {r_mean:.3f}   learned {r_lrn:.3f}   "
               f"delta {r_lrn - r_mean:+.3f}", flush=True)
         if wb is not None:
-            wb.log({f"rank1_mean_k{k}": r_mean, f"rank1_learned_k{k}": r_lrn, "k": k})
+            wb.log({f"test_rank1_mean_k{k}": r_mean, f"test_rank1_learned_k{k}": r_lrn, "k": k})
     ckpt_out = ARTIFACTS / f"agg_{args.model}_{args.aggregator}_K{args.sub_centers}.pt"
-    torch.save(agg.state_dict(), ckpt_out)
-    print(f"\nsaved aggregator -> {ckpt_out}", flush=True)
+    torch.save(dict(state=best["state"], aggregator=args.aggregator, sub_centers=args.sub_centers,
+                    k=args.k, embed_dim=D, model=args.model, tag=args.tag, best_epoch=best["epoch"],
+                    val_metrics=best["m"], test_mean=tm_mean, test_learned=tm_lrn, test_kcurve=kcurve),
+               ckpt_out)
+    print(f"\nsaved aggregator (best epoch {best['epoch']}) -> {ckpt_out}", flush=True)
     if args.hf_repo:                                     # offload to HF like train.py
         from stepup.hf import push_files
         push_files(args.hf_repo, [ckpt_out], args.hf_token)

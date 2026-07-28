@@ -1,4 +1,5 @@
 """Shared argparse options for the train / eval / compare CLIs."""
+from stepup.config import DEF_LR, DEF_WD
 
 
 def add_common_args(ap):
@@ -12,11 +13,11 @@ def add_common_args(ap):
                         "fitness (not a single noisy metric). 0 = never early-stop (train all epochs).")
     g.add_argument("--steps-per-epoch", type=int, default=0,
                    help="0 = a full pass over the training footsteps at the model's batch")
-    g.add_argument("--lr", type=float, default=1e-3,
+    g.add_argument("--lr", type=float, default=DEF_LR,
                    help="AdamW LR (reference-tuned 1e-3; raise for very large batches)")
     g.add_argument("--warmup-frac", type=float, default=0.05,
                    help="linear LR warmup fraction of epochs (short; reference ~3 epochs)")
-    g.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay (strong reg)")
+    g.add_argument("--weight-decay", type=float, default=DEF_WD, help="AdamW weight decay (strong reg)")
     g.add_argument("--margin-warmup-frac", type=float, default=0.1,
                    help="ArcFace only: ramp the angular margin 0->target over this fraction of "
                         "epochs (prevents early embedding collapse)")
@@ -113,7 +114,7 @@ def apply_smoke(args):
     args.workers = 0
     args.val_monitor = 200
     args.log_every = 2                               # tiny epochs -> log every 2 steps
-    args.P, args.K = args.P or 2, args.K or 4        # keep user --P/--K if given
+    args.P, args.K = args.P or 2, args.K or DEF_M    # keep user --P/--K if given
     if args.sample3d == "full":
         args.sample3d = "24,32,24"
     return args

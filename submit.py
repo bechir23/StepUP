@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from stepup.config import ARTIFACTS, FOOTWEAR, T, dev
+from stepup.config import ARTIFACTS, DEF_WALK_K, FOOTWEAR, T, dev
 from stepup.data import build_datasets
 from stepup.eval import embed_dataset
 from stepup.metrics import enroll_templates, report_from_scores
@@ -70,7 +70,7 @@ def main():
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--hf-repo", default=None); ap.add_argument("--hf-token", default=None)
     ap.add_argument("--score-norm", default="znorm", choices=["none", "znorm"])
-    ap.add_argument("--k", type=int, default=5, help="(recorded in the header only)")
+    ap.add_argument("--k", type=int, default=DEF_WALK_K, help="(recorded in the header only)")
     ap.add_argument("--wandb", default="disabled", choices=["disabled", "online", "offline"])
     args = ap.parse_args()
     wb = None
@@ -104,6 +104,19 @@ def main():
     fpr, tpr, thr = roc_curve(lab, s01)
     i = np.nanargmin(np.abs((1 - tpr) - fpr))
     threshold = float(thr[i])
+    # exact competition leaderboard row AT the submitted threshold: EER/FMR100 (optimized) + the
+    # operating-point metrics ACC/BACC/FNMR/FMR the organizers score at the team's own threshold.
+    gen, imp = s01[lab == 1], s01[lab == 0]
+    fnmr = float((gen < threshold).mean()); fmr = float((imp >= threshold).mean())
+    acc = float(((gen >= threshold).sum() + (imp < threshold).sum()) / len(s01))
+    bacc = 1 - (fmr + fnmr) / 2
+    rr = report_from_scores(s, lab)
+    print(f"  LEADERBOARD ({args.score_norm}) @ thr {threshold:.3f}:  EER {rr['eer']*100:5.2f}  "
+          f"FMR100 {rr['fmr100']*100:5.2f}  ACC {acc*100:5.2f}  BACC {bacc*100:5.2f}  "
+          f"FNMR {fnmr*100:5.2f}  FMR {fmr*100:5.2f}", flush=True)
+    if wb is not None:
+        wb.log({"lb_eer": rr["eer"], "lb_fmr100": rr["fmr100"], "lb_acc": acc,
+                "lb_bacc": bacc, "lb_fnmr": fnmr, "lb_fmr": fmr})
     scores_f = ARTIFACTS / f"scores_{args.model}.txt"   # per-model names: no collision on HF
     thr_f = ARTIFACTS / f"threshold_{args.model}.txt"
     np.savetxt(scores_f, s01, fmt="%.6f")
