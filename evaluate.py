@@ -12,7 +12,7 @@ import argparse
 import pandas as pd
 import torch
 
-from stepup.config import ARTIFACTS, T, dev, seed_everything
+from stepup.config import ARTIFACTS, DEF_KS, T, dev, seed_everything
 from stepup.data import build_datasets
 from stepup.eval import (accumulated_identification, cross_footwear_verification,
                          leave_one_footwear_out, open_set_accumulated, plot_embeddings, summarise)
@@ -24,7 +24,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="model name (must match the checkpoint)")
     ap.add_argument("--ckpt", default=None, help="path to a checkpoint (default artifacts/{model}_best.pt)")
-    ap.add_argument("--ks", default="1,3,5,10", help="accumulation levels for rank-1")
+    ap.add_argument("--ks", default=DEF_KS, help="accumulation levels for rank-1")
     ap.add_argument("--split", default="test", choices=["val", "test"])
     ap.add_argument("--plot-embed", action="store_true")
     ap.add_argument("--hf-repo", default=None, help="fetch the checkpoint from this HF repo if not local")
