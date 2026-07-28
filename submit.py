@@ -76,8 +76,8 @@ def main():
     wb = None
     if args.wandb != "disabled":
         import wandb as _wb
-        wb = _wb.init(project="stepup-footstep", name=f"submit_{args.model}", mode=args.wandb,
-                      config=vars(args))
+        rname = f"submit_{args.model}" + (f"_{args.tag}" if args.tag else "")
+        wb = _wb.init(project="stepup-footstep", name=rname, mode=args.wandb, config=vars(args))
 
     net, cfg = load_backbone(args.model, args.ckpt, args.hf_repo, args.hf_token, args.in_frames, args.tag)
     if args.pack_device:
@@ -117,8 +117,9 @@ def main():
     if wb is not None:
         wb.log({"lb_eer": rr["eer"], "lb_fmr100": rr["fmr100"], "lb_acc": acc,
                 "lb_bacc": bacc, "lb_fnmr": fnmr, "lb_fmr": fmr})
-    scores_f = ARTIFACTS / f"scores_{args.model}.txt"   # per-model names: no collision on HF
-    thr_f = ARTIFACTS / f"threshold_{args.model}.txt"
+    sfx = f"_{args.tag}" if args.tag else ""             # per-model+tag: no collision on HF
+    scores_f = ARTIFACTS / f"scores_{args.model}{sfx}.txt"
+    thr_f = ARTIFACTS / f"threshold_{args.model}{sfx}.txt"
     np.savetxt(scores_f, s01, fmt="%.6f")
     with open(thr_f, "w") as fh:
         fh.write(f"{threshold:.6f}\n")
