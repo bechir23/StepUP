@@ -53,6 +53,7 @@ def main():
 
     for name in names:
         spec = reg[name]
+        aname = f"{name}_{args.tag}" if getattr(args, 'tag', '') else name  # unique artifact name per run
         cfg["lr_mult"] = spec.get("lr_mult", 1.0)     # heavy nets auto-get a lower LR
         P0, K0 = spec["full_pk"]
         P, K = args.P or P0, args.K or K0            # --P/--K override the per-model batch
@@ -60,8 +61,8 @@ def main():
         if args.mixstyle and name in ("r2plus1d", "r2plus1d_light", "r3d", "r3d_light", "gaitcnn"):
             mkw["mixstyle"] = True                    # footwear-invariance: mix instance stats early
         steps = cfg["steps_per_epoch"] or max(1, len(man["train"]) // (P * K))
-        run = init_run(args, cfg, name)
-        net, hist, best = train(spec["fn"], man["train"], cfg, tag=name,
+        run = init_run(args, cfg, aname)
+        net, hist, best = train(spec["fn"], man["train"], cfg, tag=aname,
                                 max_epochs=cfg["epochs"], patience=cfg["patience"],
                                 steps_per_epoch=steps, P=P, K=K, model_kw=mkw,
                                 ds_tr=ds["train"], ds_va=ds["val_mon"],
@@ -69,20 +70,20 @@ def main():
                                 wandb_run=run)
         torch.save(dict(state=best["state"], cfg=cfg, model=name, kw=spec["kw"],
                         val_fitness=best["val"], epoch=best["epoch"]),
-                   ARTIFACTS / f"{name}_best.pt")
-        hist.to_parquet(ARTIFACTS / f"hist_{name}.parquet", index=False)
-        plot_history(hist, f"{name} training", ARTIFACTS / f"curves_{name}.png")
+                   ARTIFACTS / f"{aname}_best.pt")
+        hist.to_parquet(ARTIFACTS / f"hist_{aname}.parquet", index=False)
+        plot_history(hist, f"{aname} training", ARTIFACTS / f"curves_{aname}.png")
 
         ev = leave_one_footwear_out(net, ds["test"])
-        ev.to_parquet(ARTIFACTS / f"test_{name}.parquet", index=False)
+        ev.to_parquet(ARTIFACTS / f"test_{aname}.parquet", index=False)
         vr = cross_footwear_verification(net, ds["test"])
-        pd.DataFrame([vr]).to_parquet(ARTIFACTS / f"verif_{name}.parquet", index=False)
+        pd.DataFrame([vr]).to_parquet(ARTIFACTS / f"verif_{aname}.parquet", index=False)
         acc = accumulated_identification(net, ds["test"])
-        pd.DataFrame([acc]).to_parquet(ARTIFACTS / f"acc_{name}.parquet", index=False)
+        pd.DataFrame([acc]).to_parquet(ARTIFACTS / f"acc_{aname}.parquet", index=False)
         cond = condition_verification(net, ds["test"])                 # competition seen/unseen split
-        pd.DataFrame(cond).T.to_parquet(ARTIFACTS / f"cond_{name}.parquet")
+        pd.DataFrame(cond).T.to_parquet(ARTIFACTS / f"cond_{aname}.parquet")
         s = summarise(ev)
-        print(f"\n{name} TEST  cross rank1 {s.get('cross_rank1', float('nan')):.3f}  "
+        print(f"\n{aname} TEST  cross rank1 {s.get('cross_rank1', float('nan')):.3f}  "
               f"EER {vr['eer']:.3f}  BACC {vr['balanced_accuracy']:.3f}  F1 {vr['f1']:.3f}  "
               f"recall {vr['recall']:.3f}")
         for c in ("seen", "unseen"):                                    # competition metric set
@@ -97,17 +98,17 @@ def main():
         print("  mixed-gallery acc rank1 (=val)    " + "  ".join(f"{k}-step {v:.3f}"
               for k, v in mg.items()))                            # same protocol as val_r1(mixed5)
         if args.plot_embed:
-            p = plot_embeddings(net, ds["test"], f"{name} test embeddings",
-                                ARTIFACTS / f"embed_{name}.png")
+            p = plot_embeddings(net, ds["test"], f"{aname} test embeddings",
+                                ARTIFACTS / f"embed_{aname}.png")
             print(f"  embedding plot -> {p}")
         if run is not None:
             run.summary["best_fitness"] = best["val"]; run.finish()
         if args.hf_repo:                          # push this model's artifacts to HF storage
             from stepup.hf import push_model
-            push_model(args.hf_repo, name, ARTIFACTS, args.hf_token)
-            print(f"  pushed {name} artifacts -> https://huggingface.co/{args.hf_repo}")
+            push_model(args.hf_repo, aname, ARTIFACTS, args.hf_token)
+            print(f"  pushed {aname} artifacts -> https://huggingface.co/{args.hf_repo}")
             if args.hf_offload:                   # keep the folder light: models live on HF only
-                ckpt = ARTIFACTS / f"{name}_best.pt"
+                ckpt = ARTIFACTS / f"{aname}_best.pt"
                 if ckpt.exists():
                     ckpt.unlink()
                     print(f"  offloaded {ckpt.name} (removed local copy; on HF)")

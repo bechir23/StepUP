@@ -192,17 +192,16 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
                 s[f"{c}_eer"] = cond[c]["eer"]; s[f"{c}_fmr100"] = cond[c]["fmr100"]
         # NEW smooth generalization panel (auc/dprime/emb_margin/silhouette) on VAL, and on a
         # seen-id TRAIN subset -> the train-vs-val GAP that exposes overfitting as it happens.
-        vpan = separability_panel(*fyf)
-        vrep = representation_metrics(*fyf)                  # research embedding-quality metrics
-        for k, v in vpan.items():
-            s[f"val_{k}"] = v
-        for k, v in vrep.items():
-            s[f"val_{k}"] = v
-        if ds_tr_mon is not None:
-            tf = embed_dataset(eval_net, ds_tr_mon)
-            tpan = separability_panel(*tf); trep = representation_metrics(*tf)
-            for k, v in {**tpan, **trep}.items():
-                s[f"tr_{k}"] = v; s[f"gap_{k}"] = float(v - {**vpan, **vrep}[k])   # train-val gap
+        s["val_auc"] = separability_panel(*fyf)["auc"]       # verification ROC-AUC (fitness uses it)
+        if os.environ.get("STEPUP_DIAG") == "1":             # opt-in research diagnostics (off by default)
+            vpan = separability_panel(*fyf); vrep = representation_metrics(*fyf)
+            for k, v in {**vpan, **vrep}.items():
+                s[f"val_{k}"] = v
+            if ds_tr_mon is not None:
+                tf = embed_dataset(eval_net, ds_tr_mon)
+                tpan = separability_panel(*tf); trep = representation_metrics(*tf)
+                for k, v in {**tpan, **trep}.items():
+                    s[f"tr_{k}"] = v; s[f"gap_{k}"] = float(v - {**vpan, **vrep}[k])
         if swa_on and epoch + 1 >= swa_start:                # running SWA weight average
             msd = net.state_dict()
             if swa_sd is None:
@@ -247,22 +246,18 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         hist.append(er)
         if wandb_run is not None:
             wandb_run.log({"step": gstep, "epoch": epoch, "lr": lr, **s})
-        print(f"{tag} ep {epoch + 1:>3}/{max_epochs} step {gstep}  loss {er['train_loss']:6.3f}  "
-              f"id {er['id_loss']:6.3f}  tri {er['triplet_loss']:5.3f}  lr {lr:.2e}  "
-              f"val_eer {s.get('cross_eer', float('nan')):.3f}  "
-              f"val_r1(cross) {s.get('cross_rank1', float('nan')):.3f}  "
-              f"val_r1(mixed5) {mixed5:.3f}  "
-              f"EER(seen/unseen) {s.get('seen_eer', float('nan'))*100:.1f}/"
-              f"{s.get('unseen_eer', float('nan'))*100:.1f}  gn {grad_norm:.2f}  "
-              f"fit {fitness:.3f}\n"
-              f"        cross_mAP {s.get('cross_map', float('nan')):.3f}  "
-              f"cross_r5 {s.get('cross_rank5', float('nan')):.3f}  "
-              f"val_auc {s.get('val_auc', float('nan')):.3f}  "
-              f"align {s.get('val_alignment', float('nan')):.3f}  "
-              f"unif {s.get('val_uniformity', float('nan')):.2f}  "
-              f"fisher {s.get('val_fisher', float('nan')):.3f}  "
-              f"erank {s.get('val_erank', float('nan')):.1f}  "
-              f"DB {s.get('val_davies_bouldin', float('nan')):.2f}", flush=True)
+        # aligned professional metric set (EER / CMC / TAR@FAR / accumulated) + normalized loss
+        print(f"{tag} ep {epoch + 1:>3}/{max_epochs} step {gstep}  "
+              f"loss {er['train_loss']:6.3f}  "
+              f"id {er['id_loss']:5.3f}  tri {er['triplet_loss']:5.3f}  lr {lr:.2e}  "
+              f"EER {s.get('cross_eer', float('nan')):.3f}  "
+              f"rank1 {s.get('cross_rank1', float('nan')):.3f}  "
+              f"rank5 {s.get('cross_rank5', float('nan')):.3f}  "
+              f"mAP {s.get('cross_map', float('nan')):.3f}  "
+              f"acc_r1@5 {mixed5:.3f}  "
+              f"EER(s/u) {s.get('seen_eer', float('nan')) * 100:.1f}/{s.get('unseen_eer', float('nan')) * 100:.1f}  "
+              f"TAR@1% {s.get('cross_tar1', float('nan')):.3f}  "
+              f"auc {s.get('val_auc', float('nan')):.3f}  gn {grad_norm:.2f}  fit {fitness:.3f}", flush=True)
 
         fit_window.append(fitness)                           # smoothed fitness = mean of last 3
         smooth = float(np.mean(fit_window[-3:]))
