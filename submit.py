@@ -25,6 +25,10 @@ def load_backbone(model, ckpt, hf_repo, hf_token, in_frames=0, tag=""):
     if not os.path.exists(ckpt or ""):
         ckpt = str(ARTIFACTS / fname)
     if not os.path.exists(ckpt):
+        if not hf_repo:
+            raise FileNotFoundError(
+                f"backbone checkpoint '{fname}' not found in {ARTIFACTS} and no --hf-repo to fetch it "
+                f"from. Train Stage 1 first (saves {fname} after all epochs), or pass --hf-repo.")
         from stepup.hf import fetch_file
         ckpt = fetch_file(hf_repo, fname, hf_token)
         print(f"fetched checkpoint from HF: {ckpt}", flush=True)
@@ -70,7 +74,12 @@ def main():
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--hf-repo", default=None); ap.add_argument("--hf-token", default=None)
     ap.add_argument("--score-norm", default="znorm", choices=["none", "znorm"])
-    ap.add_argument("--k", type=int, default=DEF_WALK_K, help="(recorded in the header only)")
+    ap.add_argument("--k", type=int, default=DEF_WALK_K, help="footsteps per walk (walk mode)")
+    ap.add_argument("--walk", action="store_true",
+                    help="calibrate at the WALK level (mean-pool k footsteps) so Stage 3 chains from "
+                         "Stage 2 -- EER should drop below the single-footstep number")
+    ap.add_argument("--agg-ckpt", default="",
+                    help="Stage-2 aggregator .pt to pool the walk with (implies --walk); else mean pool")
     ap.add_argument("--wandb", default="disabled", choices=["disabled", "online", "offline"])
     args = ap.parse_args()
     wb = None
@@ -86,10 +95,29 @@ def main():
     f, y, fw = embed_dataset(net, ds["test"])
     print(f"embedded test: {len(f)} steps, {len(np.unique(y.numpy()))} ids", flush=True)
 
+    level = "footstep"
+    if args.walk or args.agg_ckpt:      # Stage-3-on-Stage-2: calibrate WALK-level scores (chain)
+        from aggregate import walk_windows, build_walk_embeds, make_aggregator
+        agg = None
+        if args.agg_ckpt:
+            path = args.agg_ckpt if os.path.exists(args.agg_ckpt) else str(ARTIFACTS / args.agg_ckpt)
+            ck = torch.load(path, map_location=dev, weights_only=False)
+            agg = make_aggregator(ck.get("aggregator", "pma"), f.shape[1]).to(dev)
+            agg.load_state_dict(ck["state"]); agg.eval()
+            print(f"loaded Stage-2 aggregator {ck.get('aggregator')} (best epoch {ck.get('best_epoch')})",
+                  flush=True)
+        win = walk_windows(ds["test"].m.reset_index(drop=True), args.k)
+        ew, yw, fww = build_walk_embeds(f, win, agg=agg)     # one embedding per single-shoe walk
+        f, y, fw = ew, torch.as_tensor(yw), np.asarray(fww)
+        level = f"walk(k={args.k},{'learned' if agg else 'mean'})"
+        print(f"walk-level: {len(f)} walks  [{level}]", flush=True)
+
     # ablation the reference ran: raw vs z-norm
+    rows = []
     for norm in ("none", "znorm"):
         s, lab = cross_scores(f, y, fw, score_norm=norm)
         r = report_from_scores(s, lab)
+        rows.append({"score_norm": norm, **{k: float(v) for k, v in r.items()}})
         print(f"  score-norm={norm:5s}  EER {r['eer']*100:5.2f}  FMR100 {r['fmr100']*100:5.2f}  "
               f"BACC {r['balanced_accuracy']*100:5.2f}  ACC {r['accuracy']*100:5.2f}", flush=True)
         if wb is not None:
@@ -117,19 +145,27 @@ def main():
     if wb is not None:
         wb.log({"lb_eer": rr["eer"], "lb_fmr100": rr["fmr100"], "lb_acc": acc,
                 "lb_bacc": bacc, "lb_fnmr": fnmr, "lb_fmr": fmr})
-    sfx = f"_{args.tag}" if args.tag else ""             # per-model+tag: no collision on HF
+    wtag = "" if level == "footstep" else f"_walk{args.k}"   # keep walk-level runs distinct from the
+    sfx = (f"_{args.tag}" if args.tag else "") + wtag        # single-footstep competition submission
     scores_f = ARTIFACTS / f"scores_{args.model}{sfx}.txt"
     thr_f = ARTIFACTS / f"threshold_{args.model}{sfx}.txt"
     np.savetxt(scores_f, s01, fmt="%.6f")
     with open(thr_f, "w") as fh:
         fh.write(f"{threshold:.6f}\n")
-    print(f"wrote {len(s01)} scores -> {scores_f}  |  threshold {threshold:.4f} -> {thr_f}  "
-          f"(norm={args.score_norm}, k={args.k})  # rename to scores.txt/threshold.txt for the "
-          f"competition zip", flush=True)
-    if args.hf_repo:                                     # push the submission files to HF
+    # Python-readable leaderboard parquet (raw vs znorm + the operating-point row) for analysis/plots
+    import pandas as pd
+    rows.append({"score_norm": f"{args.score_norm}@thr", "eer": rr["eer"], "fmr100": rr["fmr100"],
+                 "accuracy": acc, "balanced_accuracy": bacc, "fnmr": fnmr, "fmr": fmr,
+                 "threshold": threshold})
+    lb_f = ARTIFACTS / f"submit_{args.model}{sfx}.parquet"
+    pd.DataFrame(rows).to_parquet(lb_f, index=False)
+    print(f"wrote {len(s01)} scores -> {scores_f.name}  |  threshold {threshold:.4f} -> {thr_f.name}  "
+          f"|  metrics -> {lb_f.name}  (norm={args.score_norm}, k={args.k})  # rename to "
+          f"scores.txt/threshold.txt for the competition zip", flush=True)
+    if args.hf_repo:                                     # push submission + metrics parquet to HF
         from stepup.hf import push_files
-        push_files(args.hf_repo, [scores_f, thr_f], args.hf_token)
-        print(f"pushed submission -> https://huggingface.co/{args.hf_repo}", flush=True)
+        push_files(args.hf_repo, [scores_f, thr_f, lb_f], args.hf_token)
+        print(f"pushed submission + metrics -> https://huggingface.co/{args.hf_repo}", flush=True)
     if wb is not None:
         wb.finish()
 
