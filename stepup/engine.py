@@ -157,8 +157,9 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         crit.set_margin_frac((epoch + 1) / margin_warmup)   # ArcFace margin ramp (no-op for CE)
         net.train(); crit.train()
         ep_loss, ep_id, ep_tri, ep_gn = [], [], [], []
-        steps = tqdm(epoch_batches(), total=steps_per_epoch, leave=False,
-                     desc=f"{tag} ep {epoch + 1}/{max_epochs}")
+        steps = tqdm(epoch_batches(), total=steps_per_epoch, leave=False, disable=None,
+                     desc=f"{tag} ep {epoch + 1}/{max_epochs}")   # disable=None: off on non-TTY
+
         for xb, yb, fwb in steps:
             set_schedule(gstep)                              # YOLO-style per-iteration LR + momentum
             opt.zero_grad()
@@ -199,7 +200,7 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
             lv = loss.item()
             ep_loss.append(lv); ep_id.append(l_id); ep_tri.append(l_tri)
             win["loss"].append(lv); win["id"].append(l_id); win["tri"].append(l_tri)
-            steps.set_postfix(loss=f"{lv:.2f}", id=f"{l_id:.2f}")
+            steps.set_postfix(loss=f"{lv / 4:.2f}", id=f"{l_id / 4:.2f}")   # /4 = per-K, like the epoch line
             if gstep % log_every == 0:                       # dense step-based train curve
                 r = dict(step=gstep, epoch=epoch, train_loss=float(np.mean(win["loss"])),
                          id_loss=float(np.mean(win["id"])), triplet_loss=float(np.mean(win["tri"])))
