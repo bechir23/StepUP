@@ -148,18 +148,19 @@ def leave_one_footwear_out(net, ds, precomp=None):
                 g_sel, p_sel = g, p
             if g_sel.sum() == 0 or p_sel.sum() == 0:
                 continue
-            cmc, mp = identification(f[p_sel], y[p_sel], f[g_sel], y[g_sel])
+            cmc, mp = identification(f[p_sel], y[p_sel], f[g_sel], y[g_sel], topk=(1, 3, 5))
             eer, tar = verification(f[p_sel], y[p_sel], f[g_sel], y[g_sel])
             rows.append(dict(enrol=enrol, probe=probe, kind="same" if enrol == probe else "cross",
-                             rank1=cmc[1], rank5=cmc[5], mAP=mp, eer=eer, tar1=tar,
+                             rank1=cmc[1], rank3=cmc[3], rank5=cmc[5], mAP=mp, eer=eer, tar1=tar,
                              n_probe=int(p_sel.sum())))
     import pandas as pd
     return pd.DataFrame(rows)
 
 
-def cross_footwear_verification(net, ds):
-    """Pooled cross-footwear genuine/impostor scores -> full competition report."""
-    f, y, fw = embed_dataset(net, ds)
+def cross_footwear_scores(net, ds, precomp=None):
+    """Pooled cross-footwear genuine/impostor similarity scores + binary genuine labels -- the raw
+    material shared by the verification report and the DET curve (so both use identical scores)."""
+    f, y, fw = precomp if precomp is not None else embed_dataset(net, ds)
     fw = np.asarray(fw)
     scores, labels = [], []
     for enrol in FOOTWEAR:
@@ -171,7 +172,13 @@ def cross_footwear_verification(net, ds):
         sim = (F.normalize(f[p]) @ templates.t()).numpy()
         genuine = (ids[None, :] == y[p][:, None]).numpy()
         scores.append(sim.ravel()); labels.append(genuine.ravel())
-    return report_from_scores(np.concatenate(scores), np.concatenate(labels))
+    return np.concatenate(scores), np.concatenate(labels)
+
+
+def cross_footwear_verification(net, ds):
+    """Pooled cross-footwear genuine/impostor scores -> full competition report."""
+    scores, labels = cross_footwear_scores(net, ds)
+    return report_from_scores(scores, labels)
 
 
 def condition_verification(net, ds, precomp=None):
@@ -297,6 +304,7 @@ def summarise(df):
             # impactful identification metrics already computed per shoe-pair but previously
             # discarded: mAP (full-ranking quality) and TAR@1%FAR (deployment gate accept rate).
             out[f"{kind}_map"] = float(np.nanmean(sub.mAP))
+            out[f"{kind}_rank3"] = float(np.nanmean(sub.rank3))
             out[f"{kind}_rank5"] = float(np.nanmean(sub.rank5))
             out[f"{kind}_tar1"] = float(np.nanmean(sub.tar1))
     return out
@@ -347,15 +355,17 @@ def project_2d(feats):
                     perplexity=30, random_state=SEED).fit_transform(feats)
 
 
-def plot_embeddings(net, ds, title, out_path, max_pts=2500):
-    """2D projection coloured by identity and by footwear; saved to out_path."""
+def embedding_panel(f, y, fw, title, max_pts=2500):
+    """2D UMAP/t-SNE projection as a 2-panel figure: coloured by identity, and by footwear. Takes
+    ALREADY-EMBEDDED (f, y, fw) so it can be reused for a periodic per-epoch snapshot (on the val
+    embeddings computed anyway) and for the final test plot. Returns the matplotlib figure; the
+    caller saves it and/or logs it to wandb, then closes it."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    f, y, fw = embed_dataset(net, ds)
     if len(f) > max_pts:
         idx = np.random.default_rng(SEED).choice(len(f), max_pts, replace=False)
-        f, y, fw = f[idx], y[idx], fw[idx]
+        f, y, fw = f[idx], y[idx], np.asarray(fw)[idx]
     xy = project_2d(f.numpy())
     fw = np.asarray(fw)
     fig, ax = plt.subplots(1, 2, figsize=(12, 5.2))
@@ -369,6 +379,44 @@ def plot_embeddings(net, ds, title, out_path, max_pts=2500):
     for a in ax:
         a.set_xticks([]); a.set_yticks([]); a.grid(False)
     fig.suptitle(title); fig.tight_layout()
+    return fig
+
+
+def plot_embeddings(net, ds, title, out_path, max_pts=2500):
+    """Embed a dataset and save the 2-panel identity/footwear projection to out_path."""
+    import matplotlib.pyplot as plt
+    f, y, fw = embed_dataset(net, ds)
+    fig = embedding_panel(f, y, fw, title, max_pts)
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
     return out_path
+
+
+def plot_det(scores, labels, title, out_path=None):
+    """Detection Error Tradeoff (StepUP competition Fig 2 style): FNMR vs FMR in %, with the EER
+    point on the FNMR=FMR diagonal and the FMR=1% operating line whose FNMR is the reported FMR100.
+    wandb cannot draw this itself. Returns the figure (out_path=None) or saves + returns the path."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import roc_curve
+    scores = np.asarray(scores); labels = np.asarray(labels).astype(int)
+    fpr, tpr, _ = roc_curve(labels, scores)
+    fnr = 1 - tpr
+    i = np.nanargmin(np.abs(fnr - fpr)); eer = float((fpr[i] + fnr[i]) / 2)
+    fmr100 = float(np.interp(0.01, fpr, fnr))                    # FNMR at FMR=1% (competition metric)
+    fig, ax = plt.subplots(figsize=(5.4, 5))
+    ax.plot(fpr * 100, fnr * 100, lw=2, color="tab:blue")
+    ax.plot([0, 100], [0, 100], ls=":", c="gray", lw=1)         # FNMR = FMR diagonal
+    ax.scatter([eer * 100], [eer * 100], color="tab:red", zorder=5, label=f"EER = {eer * 100:.2f}%")
+    ax.axvline(1.0, ls="--", c="tab:green", lw=1)               # FMR = 1% operating point
+    ax.scatter([1.0], [fmr100 * 100], color="tab:green", zorder=5,
+               label=f"FMR100 = {fmr100 * 100:.2f}%")
+    hi = max(5.0, min(100.0, eer * 100 * 3))                    # zoom to the informative region
+    ax.set_xlim(0, hi); ax.set_ylim(0, max(hi, fmr100 * 100 * 1.1))
+    ax.set_xlabel("FMR (%)"); ax.set_ylabel("FNMR (%)")
+    ax.set_title(title); ax.legend(fontsize=8, loc="upper right"); ax.grid(alpha=.3)
+    fig.tight_layout()
+    if out_path is not None:
+        fig.savefig(out_path, dpi=120); plt.close(fig); return out_path
+    return fig

@@ -27,6 +27,7 @@ from pytorch_metric_learning import losses
 from stepup.config import ARTIFACTS, dev
 from stepup.data import build_datasets
 from stepup.eval import embed_dataset
+from stepup.rl_viz import RLPolicyLog
 from aggregate import walk_metrics
 from finetune import load_backbone_trainable
 
@@ -141,6 +142,8 @@ def main():
     print(f"  BEFORE  test cross-fw EER {base['eer']:.3f} rank1 {base['rank1']:.3f}", flush=True)
     rng = np.random.default_rng(0)
 
+    rl_log = RLPolicyLog(OP_NAMES, eer_label="test cross-fw EER")                        # 6 thesis figures
+    sample_x = None                                                                     # real cube for Fig 1
     for ep in range(args.epochs):
         net.train(); tot = 0.0; op_hits = np.zeros(len(OPS))
         strength = min(1.0, (ep + 1) / max(1, args.warmup))                             # ramp adversary in
@@ -153,6 +156,8 @@ def main():
             else:                                                                       # cpu/memmap path
                 xb = torch.stack([dstr[r][0] for r in rows]).to(dev)
                 yb = torch.tensor([dstr[r][1] for r in rows], device=dev)
+            if sample_x is None:
+                sample_x = xb[:1].detach().clone()                                      # -> Fig 1 panel
             losses_m, logps = [], []
             for _ in range(args.M):                                                    # M augmented copies
                 op, mag, logp = policy.sample(); op_hits[op] += 1
@@ -169,14 +174,19 @@ def main():
             opt_pol.zero_grad(); pol_loss.backward(); opt_pol.step()
             tot += L.mean().item()
         te = cross_fw_eer(net, ds["test"])
-        top = OP_NAMES[int(op_hits.argmax())]
+        # ---- canonical RL training scalars (reward, entropy, mean magnitude); full policy state
+        #      goes to the six figures at the end, not into per-epoch streams ----
+        rl_scalars = rl_log.update(policy, reward=tot / args.steps, eer=te["eer"])
+        with torch.no_grad():
+            op_p = torch.softmax(policy.op_logits, 0)
+        top = OP_NAMES[int(op_p.argmax())]
         print(f"  ep {ep + 1:>2}/{args.epochs}  id {tot / args.steps:6.3f}  "
               f"test EER {te['eer']:.3f} rank1 {te['rank1']:.3f}  | base {base['eer']:.3f}  "
-              f"top-op {top}", flush=True)
+              f"top-op {top}({op_p.max():.2f})  H {rl_scalars['rl/policy_entropy']:.2f}  "
+              f"mag {rl_scalars['rl/mean_magnitude']:.2f}", flush=True)
         if wb is not None:
-            wb.log({"epoch": ep + 1, "id_loss": tot / args.steps, "test_eer": te["eer"],
-                    "test_rank1": te["rank1"], "base_eer": base["eer"],
-                    **{f"op_{n}": op_hits[i] for i, n in enumerate(OP_NAMES)}})
+            wb.log({"epoch": ep + 1, "test_eer": te["eer"], "test_rank1": te["rank1"],
+                    "base_eer": base["eer"], **rl_scalars})
 
     fin = cross_fw_eer(net, ds["test"])
     print(f"\n=== RESULT ===\n  BEFORE EER {base['eer']:.3f} rank1 {base['rank1']:.3f}\n"
@@ -185,6 +195,15 @@ def main():
           f"({'WIN' if fin['eer'] < base['eer'] - 1e-3 else 'no gain'})", flush=True)
     print("  learned op probs:", {OP_NAMES[i]: round(p, 2) for i, p in
                                    enumerate(torch.softmax(policy.op_logits, 0).tolist())}, flush=True)
+    print("  learned magnitudes (mean bin/10 per op):",
+          {OP_NAMES[i]: round(float(m), 2) for i, m in enumerate(
+              (torch.softmax(policy.mag_logits, 1) *
+               torch.arange(policy.n_mag, device=policy.mag_logits.device)).sum(1) / policy.n_mag)},
+          flush=True)
+    # ---- the six interpretability figures (action panel, P(op) traj, entropy, magnitude,
+    #      op heatmap, reward-vs-EER) written to artifacts/ and logged to wandb ----
+    prefix = f"rlaug_{args.model}" + (f"_{args.tag}" if args.tag else "")
+    rl_log.render(policy, ARTIFACTS, prefix=prefix, apply_op=apply_op, sample_x=sample_x, wandb_run=wb)
     if wb is not None:
         wb.finish()
 

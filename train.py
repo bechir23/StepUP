@@ -22,8 +22,9 @@ from stepup.config import ARTIFACTS, T, build_cfg, seed_everything
 from stepup.data import build_datasets
 from stepup.engine import train
 from stepup.eval import (accumulated_identification, condition_verification,
-                         cross_footwear_verification, leave_one_footwear_out, open_set_accumulated,
-                         plot_embeddings, plot_history, summarise)
+                         cross_footwear_scores, cross_footwear_verification, embed_dataset,
+                         embedding_panel, leave_one_footwear_out, open_set_accumulated,
+                         plot_det, plot_embeddings, plot_history, summarise)
 from stepup.models import registry, set_dropout
 from stepup.wb import init_run
 
@@ -71,7 +72,8 @@ def main():
                                 steps_per_epoch=steps, P=P, K=K, model_kw=mkw,
                                 ds_tr=ds["train"], ds_va=ds["val_mon"],
                                 ds_tr_mon=ds.get("train_mon"), mining=cfg["mining"],
-                                wandb_run=run, rl_augment=getattr(args, "rl_augment", False))
+                                wandb_run=run, rl_augment=getattr(args, "rl_augment", False),
+                                rl_M=getattr(args, "rl_copies", 4))
         torch.save(dict(state=best["state"], cfg=cfg, model=name, kw=spec["kw"],
                         val_fitness=best["val"], epoch=best["epoch"]),
                    ARTIFACTS / f"{aname}_best.pt")
@@ -88,8 +90,8 @@ def main():
         pd.DataFrame(cond).T.to_parquet(ARTIFACTS / f"cond_{aname}.parquet")
         s = summarise(ev)
         print(f"\n{aname} TEST  cross rank1 {s.get('cross_rank1', float('nan')):.3f}  "
-              f"EER {vr['eer']:.3f}  BACC {vr['balanced_accuracy']:.3f}  F1 {vr['f1']:.3f}  "
-              f"recall {vr['recall']:.3f}")
+              f"EER {vr['eer']:.3f}  FMR100 {vr['fmr100'] * 100:5.2f}  "   # overall = leaderboard metric
+              f"BACC {vr['balanced_accuracy']:.3f}  recall {vr['recall']:.3f}")
         for c in ("seen", "unseen"):                                    # competition metric set
             r = cond.get(c)
             if r:
@@ -106,6 +108,21 @@ def main():
                                 ARTIFACTS / f"embed_{aname}.png")
             print(f"  embedding plot -> {p}")
         if run is not None:
+            import wandb
+            import matplotlib.pyplot as plt
+            fte = embed_dataset(net, ds["test"])                    # embed test once, reuse for both
+            try:                                                    # UMAP: identity + footwear-invariance
+                fig = embedding_panel(*fte, title=f"{aname} test embeddings")
+                run.log({"test/umap": wandb.Image(fig)}); plt.close(fig)
+            except Exception as e:
+                print(f"  (test umap skipped: {e})", flush=True)
+            try:                                                    # DET curve (competition Fig 2)
+                sc, lb = cross_footwear_scores(net, ds["test"], precomp=fte)
+                fig = plot_det(sc, lb, f"{aname} DET  (EER {vr['eer'] * 100:.2f}, "
+                                       f"FMR100 {vr['fmr100'] * 100:.2f})")
+                run.log({"test/det": wandb.Image(fig)}); plt.close(fig)
+            except Exception as e:
+                print(f"  (det curve skipped: {e})", flush=True)
             run.summary["best_fitness"] = best["val"]; run.finish()
         if args.hf_repo:                          # push this model's artifacts to HF storage
             from stepup.hf import push_model

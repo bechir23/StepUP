@@ -61,8 +61,11 @@ def report_from_scores(scores, labels):
     rec = tp / max(1, tp + fn)
     fmr = fp / max(1, fp + tn)
     fnmr = fn / max(1, fn + tp)
-    # FMR100 (competition security metric): false-match rate at the threshold where FNMR <= 1%.
-    fmr100 = float(fpr[np.argmax(fnr <= 0.01)]) if (fnr <= 0.01).any() else 1.0
+    # FMR100 (StepUP/FVC definition, per the competition report: "the FNMR when the decision
+    # threshold is fixed to achieve a FMR equal to 1%"). Read FNMR off the ROC at FMR=1% by
+    # interpolation (roc_curve gives fpr non-decreasing). The old code read FMR at FNMR=1% -- the
+    # INVERSE -- which is why our FMR100 never matched the leaderboard (winner 59.63%, not ~5-40%).
+    fmr100 = float(np.interp(0.01, fpr, fnr))
     return dict(eer=float((fpr[i] + fnr[i]) / 2), fmr100=fmr100,
                 accuracy=(tp + tn) / max(1, len(labels)),
                 balanced_accuracy=1 - (fmr + fnmr) / 2, precision=prec, recall=rec,
