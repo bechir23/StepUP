@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from .config import SEED, dev, seed_everything
+from .config import ARTIFACTS, SEED, dev, seed_everything
 from .data import FootstepData, FootwearSpanningSampler, PKSampler
 from .eval import (condition_verification, embed_dataset, leave_one_footwear_out,
                    open_set_accumulated, representation_metrics, separability_panel, summarise)
@@ -41,7 +41,8 @@ class ModelEMA:
 
 def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch=40,
           monitor="cross_eer", P=None, K=None, model_kw=None, ds_va=None, ds_tr=None,
-          ds_tr_mon=None, mining="standard", wandb_run=None, rl_augment=False, rl_warmup=8):
+          ds_tr_mon=None, mining="standard", wandb_run=None, rl_augment=False, rl_warmup=8, rl_M=4,
+          epoch_cb=None):
     """Train one backbone; validate leave-one-footwear-out; early-stop on cross EER.
     Returns (best-checkpoint net, per-epoch history df, best record)."""
     seed_everything(SEED)
@@ -55,12 +56,14 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     # RL-searched rotation/flip). Co-evolves WITH the backbone (train from scratch), guarded by a
     # flag so normal training is byte-identical when off. The policy is rewarded for raising the
     # id loss (adversarial) -> it finds the hardest identity-preserving geometry to be robust to.
-    aug_policy = aug_opt = None
+    aug_policy = aug_opt = rl_log = None
+    rl_sample = None                                     # one real footstep cube for the aug panel
     if rl_augment:
-        from rl_augment import AugPolicy, apply_op
+        from rl_augment import AugPolicy, apply_op, OP_NAMES
+        from .rl_viz import RLPolicyLog
         aug_policy = AugPolicy().to(dev)
         aug_opt = torch.optim.Adam(aug_policy.parameters(), lr=1e-2)
-        aug_baseline = 0.0
+        rl_log = RLPolicyLog(OP_NAMES, eer_label="unseen EER")   # drives all six thesis figures
     mine = MINERS[mining]
     make_sampler = FootwearSpanningSampler if mining == "crossfw" else PKSampler
     # scale the LR to our batch (sqrt rule, suited to AdamW): cfg["lr"] is tuned for batch 128,
@@ -159,14 +162,25 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         for xb, yb, fwb in steps:
             set_schedule(gstep)                              # YOLO-style per-iteration LR + momentum
             opt.zero_grad()
-            xb_in = xb
-            if aug_policy is not None:                        # RL geometric augmentation (adversarial)
+            if aug_policy is not None:                        # RL adversarial augmentation (Adversarial-
+                if rl_sample is None:                         # AutoAugment): M augmented views per batch.
+                    rl_sample = xb[:1].detach().clone()       # first real cube -> Fig 1 action panel
                 strength = min(1.0, (epoch + 1) / max(1, rl_warmup))   # ramp the adversary in
-                aug_op, aug_mag, aug_logp = aug_policy.sample()
-                xb_in = strength * apply_op(xb, aug_op, aug_mag) + (1 - strength) * xb
-            with torch.autocast(device_type=dev, enabled=use_amp):
-                f_t, f_i, _ = net(xb_in)
-                loss, l_id, l_tri = crit(f_t, f_i, yb, mine(f_t, yb, fwb), fwb)
+                losses_m, id_m, tri_m, logps = [], [], [], []
+                for _ in range(rl_M):                         # sample M policies, augment M copies
+                    op, mag, logp = aug_policy.sample()
+                    xa = strength * apply_op(xb, op, mag) + (1 - strength) * xb
+                    with torch.autocast(device_type=dev, enabled=use_amp):
+                        f_t, f_i, _ = net(xa)
+                        lm, lid, ltri = crit(f_t, f_i, yb, mine(f_t, yb, fwb), fwb)
+                    losses_m.append(lm); id_m.append(lid); tri_m.append(ltri); logps.append(logp)
+                L = torch.stack(losses_m)                     # (M,) per-copy losses
+                loss = L.mean()                               # backbone minimises the mean over copies
+                l_id, l_tri = float(np.mean(id_m)), float(np.mean(tri_m))
+            else:
+                with torch.autocast(device_type=dev, enabled=use_amp):
+                    f_t, f_i, _ = net(xb)
+                    loss, l_id, l_tri = crit(f_t, f_i, yb, mine(f_t, yb, fwb), fwb)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)                         # unscale, then clip gradients (YOLO: 10.0)
             # capture the pre-clip total gradient norm: this is the direct read on whether the
@@ -177,21 +191,23 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
             ep_gn.append(float(gn))
             scaler.step(opt); scaler.update()
             ema.update(net)                              # nudge the EMA weights toward the live net
-            if aug_policy is not None:                   # REINFORCE: reward the policy for raising loss
-                r = float(loss.item()) - aug_baseline
-                aug_baseline = 0.9 * aug_baseline + 0.1 * float(loss.item())
-                aug_opt.zero_grad(); (-aug_logp * r).backward(); aug_opt.step()
+            if aug_policy is not None:                   # REINFORCE: policy MAXIMISES the loss, with the
+                adv = L.detach() - L.detach().mean()     # batch advantage L-mean(L) as the baseline
+                pol_loss = -(torch.stack(logps) * adv).mean()   # (variance-reduced, per the paper)
+                aug_opt.zero_grad(); pol_loss.backward(); aug_opt.step()
             gstep += 1
             lv = loss.item()
             ep_loss.append(lv); ep_id.append(l_id); ep_tri.append(l_tri)
             win["loss"].append(lv); win["id"].append(l_id); win["tri"].append(l_tri)
-            steps.set_postfix(loss=f"{lv:.2f}", id=f"{l_id:.2f}", tri=f"{l_tri:.2f}")
+            steps.set_postfix(loss=f"{lv:.2f}", id=f"{l_id:.2f}")
             if gstep % log_every == 0:                       # dense step-based train curve
                 r = dict(step=gstep, epoch=epoch, train_loss=float(np.mean(win["loss"])),
                          id_loss=float(np.mean(win["id"])), triplet_loss=float(np.mean(win["tri"])))
-                hist.append(r)
-                if wandb_run is not None:
-                    wandb_run.log(r)
+                hist.append(r)                               # parquet keeps the RAW loss (incl. triplet)
+                if wandb_run is not None:                    # wandb shows /4 = the same per-K the
+                    wandb_run.log({"step": r["step"], "epoch": r["epoch"],  # console prints; triplet
+                                   "train_loss": r["train_loss"] / 4,       # dropped from wandb too
+                                   "id_loss": r["id_loss"] / 4})
                 win = dict(loss=[], id=[], tri=[])
 
         lr = opt.param_groups[0]["lr"]                        # LR now stepped per batch, not here
@@ -242,6 +258,16 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
             s["swa_cross_map"] = ssw.get("cross_map", float("nan"))
             s["swa_unseen_eer"] = (csw["unseen"]["eer"] if csw.get("unseen") else float("nan"))
             del fsw
+        if wandb_run is not None and ((epoch + 1) % 10 == 0 or epoch + 1 == max_epochs):
+            try:                        # UMAP snapshot: watch clusters tighten + footwear mix over training
+                import wandb
+                import matplotlib.pyplot as plt
+                from .eval import embedding_panel
+                fig = embedding_panel(*fyf, title=f"{tag} val embeddings  ep {epoch + 1}")
+                wandb_run.log({"val/umap": wandb.Image(fig), "step": gstep})
+                plt.close(fig)
+            except Exception as e:
+                print(f"  (umap snapshot skipped: {e})", flush=True)
         del fyf                                              # free the per-epoch val embeddings
         import gc; gc.collect()                              # reclaim RAM between epochs (low-RAM cards)
         if dev == "cuda":
@@ -265,14 +291,21 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
                   id_loss=float(np.mean(ep_id)), triplet_loss=float(np.mean(ep_tri)),
                   grad_norm=grad_norm, **s)
         hist.append(er)
+        rl_scalars = {}
+        if rl_log is not None:                               # RL diagnostics: P(op), entropy, reward
+            # reward = the mean augmented-batch loss the adversary raises; EER = the downstream payoff
+            rl_reward = float(np.mean(ep_loss)) / 4         # per-K normalized, matches printed loss
+            rl_eer = s.get("unseen_eer", s.get("cross_eer", float("nan")))
+            rl_scalars = rl_log.update(aug_policy, reward=rl_reward, eer=rl_eer)
         if wandb_run is not None:
-            wandb_run.log({"step": gstep, "epoch": epoch, "lr": lr, **s})
+            wandb_run.log({"step": gstep, "epoch": epoch, "lr": lr, **s, **rl_scalars})
         # aligned professional metric set (EER / CMC / TAR@FAR / accumulated) + normalized loss
         print(f"{tag} ep {epoch + 1:>3}/{max_epochs} step {gstep}  "
               f"loss {er['train_loss'] / 4:6.3f}  "                       # /4: per-K normalized loss
-              f"id {er['id_loss'] / 4:5.3f}  tri {er['triplet_loss'] / 4:5.3f}  lr {lr:.2e}  "
+              f"id {er['id_loss'] / 4:5.3f}  lr {lr:.2e}  "               # tri dropped (uninformative)
               f"EER {s.get('cross_eer', float('nan')):.3f}  "
               f"rank1 {s.get('cross_rank1', float('nan')):.3f}  "
+              f"rank3 {s.get('cross_rank3', float('nan')):.3f}  "
               f"rank5 {s.get('cross_rank5', float('nan')):.3f}  "
               f"mAP {s.get('cross_map', float('nan')):.3f}  "
               f"acc_r1@5 {mixed5:.3f}  "
@@ -292,8 +325,13 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
                 print(f"  early stop: no improvement in {bad} epochs (best fit {best['val']:.3f} "
                       f"@ ep {best['epoch']+1})", flush=True)
                 break
+        if epoch_cb is not None:                             # HPO pruning hook: report the per-epoch
+            epoch_cb(epoch, fitness)                         # fitness; may raise optuna.TrialPruned
 
     del loader
+    if rl_log is not None:                               # emit the six RL interpretability figures
+        rl_log.render(aug_policy, ARTIFACTS, prefix=f"rlaug_{tag}",
+                      apply_op=apply_op, sample_x=rl_sample, wandb_run=wandb_run)
     if best["state"] is not None:
         ema.ema.load_state_dict(best["state"])
     if dev == "cuda":
