@@ -71,7 +71,7 @@ def main():
                                 steps_per_epoch=steps, P=P, K=K, model_kw=mkw,
                                 ds_tr=ds["train"], ds_va=ds["val_mon"],
                                 ds_tr_mon=ds.get("train_mon"), mining=cfg["mining"],
-                                wandb_run=run)
+                                wandb_run=run, rl_augment=getattr(args, "rl_augment", False))
         torch.save(dict(state=best["state"], cfg=cfg, model=name, kw=spec["kw"],
                         val_fitness=best["val"], epoch=best["epoch"]),
                    ARTIFACTS / f"{aname}_best.pt")

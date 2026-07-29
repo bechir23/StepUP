@@ -41,7 +41,7 @@ class ModelEMA:
 
 def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch=40,
           monitor="cross_eer", P=None, K=None, model_kw=None, ds_va=None, ds_tr=None,
-          ds_tr_mon=None, mining="standard", wandb_run=None):
+          ds_tr_mon=None, mining="standard", wandb_run=None, rl_augment=False, rl_warmup=8):
     """Train one backbone; validate leave-one-footwear-out; early-stop on cross EER.
     Returns (best-checkpoint net, per-epoch history df, best record)."""
     seed_everything(SEED)
@@ -51,6 +51,16 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     net = model_fn(embed_dim=cfg["embed_dim"], n_classes=None, **(model_kw or {})).to(dev)
     ema = ModelEMA(net)                                  # YOLO-style weight EMA; val runs on this
     crit = Criterion(cfg, n_ids, cfg["embed_dim"]).to(dev)
+    # optional RL-learned GEOMETRIC augmentation policy (Adversarial-AutoAugment; winners used
+    # RL-searched rotation/flip). Co-evolves WITH the backbone (train from scratch), guarded by a
+    # flag so normal training is byte-identical when off. The policy is rewarded for raising the
+    # id loss (adversarial) -> it finds the hardest identity-preserving geometry to be robust to.
+    aug_policy = aug_opt = None
+    if rl_augment:
+        from rl_augment import AugPolicy, apply_op
+        aug_policy = AugPolicy().to(dev)
+        aug_opt = torch.optim.Adam(aug_policy.parameters(), lr=1e-2)
+        aug_baseline = 0.0
     mine = MINERS[mining]
     make_sampler = FootwearSpanningSampler if mining == "crossfw" else PKSampler
     # scale the LR to our batch (sqrt rule, suited to AdamW): cfg["lr"] is tuned for batch 128,
@@ -149,8 +159,13 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         for xb, yb, fwb in steps:
             set_schedule(gstep)                              # YOLO-style per-iteration LR + momentum
             opt.zero_grad()
+            xb_in = xb
+            if aug_policy is not None:                        # RL geometric augmentation (adversarial)
+                strength = min(1.0, (epoch + 1) / max(1, rl_warmup))   # ramp the adversary in
+                aug_op, aug_mag, aug_logp = aug_policy.sample()
+                xb_in = strength * apply_op(xb, aug_op, aug_mag) + (1 - strength) * xb
             with torch.autocast(device_type=dev, enabled=use_amp):
-                f_t, f_i, _ = net(xb)
+                f_t, f_i, _ = net(xb_in)
                 loss, l_id, l_tri = crit(f_t, f_i, yb, mine(f_t, yb, fwb), fwb)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)                         # unscale, then clip gradients (YOLO: 10.0)
@@ -162,6 +177,10 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
             ep_gn.append(float(gn))
             scaler.step(opt); scaler.update()
             ema.update(net)                              # nudge the EMA weights toward the live net
+            if aug_policy is not None:                   # REINFORCE: reward the policy for raising loss
+                r = float(loss.item()) - aug_baseline
+                aug_baseline = 0.9 * aug_baseline + 0.1 * float(loss.item())
+                aug_opt.zero_grad(); (-aug_logp * r).backward(); aug_opt.step()
             gstep += 1
             lv = loss.item()
             ep_loss.append(lv); ep_id.append(l_id); ep_tri.append(l_tri)
@@ -235,9 +254,11 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         # and higher than rank-1 itself) and val_auc (r=+0.97 with 1-unseen_eer, whole-curve so far
         # less noisy than a single-threshold EER), plus a direct unseen-EER term. This blend selects
         # exactly the epoch that maximizes both real targets.
-        fitness = (0.45 * s.get("cross_map", 0.0)               # identification quality (impact)
-                   + 0.35 * s.get("val_auc", 0.5)               # verification separability (smooth)
-                   + 0.20 * (1 - s.get("unseen_eer", 0.5)))     # unseen footwear -- the hard target
+        # best-model selection is driven by cross-footwear mAP (the impact metric) so the SAVED best
+        # checkpoint is the highest-mAP epoch; val_auc/unseen-EER only break ties (small weights).
+        fitness = (0.90 * s.get("cross_map", 0.0)               # mAP dominates -> best model = best mAP
+                   + 0.07 * s.get("val_auc", 0.5)               # tiny smoothing tie-breaker
+                   + 0.03 * (1 - s.get("unseen_eer", 0.5)))
         s["fitness"] = fitness
         grad_norm = float(np.mean(ep_gn)) if ep_gn else float("nan")
         er = dict(step=gstep, epoch=epoch, lr=lr, train_loss=float(np.mean(ep_loss)),
@@ -248,8 +269,8 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
             wandb_run.log({"step": gstep, "epoch": epoch, "lr": lr, **s})
         # aligned professional metric set (EER / CMC / TAR@FAR / accumulated) + normalized loss
         print(f"{tag} ep {epoch + 1:>3}/{max_epochs} step {gstep}  "
-              f"loss {er['train_loss']:6.3f}  "
-              f"id {er['id_loss']:5.3f}  tri {er['triplet_loss']:5.3f}  lr {lr:.2e}  "
+              f"loss {er['train_loss'] / 4:6.3f}  "                       # /4: per-K normalized loss
+              f"id {er['id_loss'] / 4:5.3f}  tri {er['triplet_loss'] / 4:5.3f}  lr {lr:.2e}  "
               f"EER {s.get('cross_eer', float('nan')):.3f}  "
               f"rank1 {s.get('cross_rank1', float('nan')):.3f}  "
               f"rank5 {s.get('cross_rank5', float('nan')):.3f}  "

@@ -27,7 +27,7 @@ from stepup.models import registry, set_dropout
 from aggregate import WalkAggregator, walk_windows, walk_metrics
 
 
-def load_backbone_trainable(model, hf_repo, hf_token, tag="", in_frames=0):
+def load_backbone_trainable(model, hf_repo, hf_token, tag="", in_frames=0, scratch=False):
     fname = f"{model}_{tag}_best.pt" if tag else f"{model}_best.pt"
     ckpt = str(ARTIFACTS / fname)
     if not os.path.exists(ckpt):
@@ -44,7 +44,8 @@ def load_backbone_trainable(model, hf_repo, hf_token, tag="", in_frames=0):
         data_t = in_frames
     spec = registry(cfg["sample3d"], data_t)[model]
     net = spec["fn"](embed_dim=cfg["embed_dim"], n_classes=None, **spec["kw"]).to(dev)
-    net.load_state_dict(ck["state"])
+    if not scratch:
+        net.load_state_dict(ck["state"])          # scratch=True -> keep the fresh random init
     return net, cfg
 
 
