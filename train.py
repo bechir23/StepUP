@@ -60,6 +60,10 @@ def main():
         mkw = dict(spec["kw"])
         if args.mixstyle and name in ("r2plus1d", "r2plus1d_light", "r3d", "r3d_light", "gaitcnn"):
             mkw["mixstyle"] = True                    # footwear-invariance: mix instance stats early
+        if getattr(args, "dsu", False) and name in ("gaitcnn", "gaitcnn_snr"):
+            mkw["dsu"] = True                         # DSU statistic perturbation (trained into backbone)
+        if getattr(args, "hpp", False) and name in ("gaitcnn", "gaitcnn_snr"):
+            mkw["hpp"] = True                         # Horizontal Pyramid (part-based) pooling
         steps = cfg["steps_per_epoch"] or max(1, len(man["train"]) // (P * K))
         run = init_run(args, cfg, aname)
         net, hist, best = train(spec["fn"], man["train"], cfg, tag=aname,

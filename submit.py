@@ -46,9 +46,15 @@ def load_backbone(model, ckpt, hf_repo, hf_token, in_frames=0, tag=""):
     return net, cfg
 
 
-def cross_scores(f, y, fw, score_norm="none"):
-    """Pooled cross-footwear (probe shoe != enrol shoe) genuine/impostor scores; optional per-
-    template cohort z-norm (standardize each template column by its impostor distribution)."""
+def cross_scores(f, y, fw, score_norm="none", as_cohort=100):
+    """Pooled cross-footwear (probe shoe != enrol shoe) genuine/impostor scores with optional score
+    normalization:
+      znorm  -- per-template cohort z-norm (standardize each template column by the probe scores).
+      asnorm -- adaptive symmetric normalization (Matejka Interspeech'17; Auckenthaler'00): for a
+                probe p vs template T_i, s'=0.5[(s-mu_e[i])/sd_e[i] + (s-mu_t[p])/sd_t[p]], where
+                mu/sd are over the top-K cohort scores of the template (vs other templates) and the
+                probe (vs all templates). Templates are L2-normalised so cosine is unbiased by
+                template magnitude (a hubness source z-norm only partly fixes)."""
     fw = np.asarray(fw)
     scores, labels = [], []
     for enrol in FOOTWEAR:
@@ -56,9 +62,22 @@ def cross_scores(f, y, fw, score_norm="none"):
         if g.sum() == 0 or p.sum() == 0:
             continue
         templates, ids = enroll_templates(f[g], y[g])
-        sim = (F.normalize(f[p]) @ templates.t()).numpy()          # (n_probe, n_templates)
-        if score_norm == "znorm":                                   # cohort normalization
+        T = F.normalize(templates)                                  # unit templates (proper cosine)
+        sim_t = F.normalize(f[p]) @ T.t()                           # (n_probe, n_templates), torch
+        if score_norm == "asnorm":
+            K = max(2, min(as_cohort, T.shape[0] - 1))
+            TT = T @ T.t(); TT.fill_diagonal_(-1e9)                 # template-vs-template, exclude self
+            te = TT.topk(K, dim=1).values                          # top-K impostor cohort per template
+            mu_e, sd_e = te.mean(1), te.std(1) + 1e-6              # (n_id,)  enrol-side stats
+            tt = sim_t.topk(K, dim=1).values                       # top-K templates per probe
+            mu_t, sd_t = tt.mean(1), tt.std(1) + 1e-6             # (n_probe,) probe-side stats
+            sim = (0.5 * ((sim_t - mu_e[None, :]) / sd_e[None, :]
+                          + (sim_t - mu_t[:, None]) / sd_t[:, None])).numpy()
+        elif score_norm == "znorm":                                 # per-template cohort z-norm
+            sim = sim_t.numpy()
             sim = (sim - sim.mean(0, keepdims=True)) / (sim.std(0, keepdims=True) + 1e-6)
+        else:
+            sim = sim_t.numpy()
         gen = (ids[None, :] == y[p][:, None]).numpy()
         scores.append(sim.ravel()); labels.append(gen.ravel().astype(int))
     return np.concatenate(scores), np.concatenate(labels)
@@ -73,7 +92,9 @@ def main():
     ap.add_argument("--pack-device", default="", choices=["", "cuda", "memmap", "cpu"], help="override the checkpoint's pack device (cuda = fast eval on Colab)")
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--hf-repo", default=None); ap.add_argument("--hf-token", default=None)
-    ap.add_argument("--score-norm", default="znorm", choices=["none", "znorm"])
+    ap.add_argument("--score-norm", default="asnorm", choices=["none", "znorm", "asnorm"])
+    ap.add_argument("--as-cohort", type=int, default=100,
+                    help="AS-norm cohort size K (top-K impostors per side; clamped to n_ids-1)")
     ap.add_argument("--k", type=int, default=DEF_WALK_K, help="footsteps per walk (walk mode)")
     ap.add_argument("--walk", action="store_true",
                     help="calibrate at the WALK level (mean-pool k footsteps) so Stage 3 chains from "
@@ -112,20 +133,20 @@ def main():
         level = f"walk(k={args.k},{'learned' if agg else 'mean'})"
         print(f"walk-level: {len(f)} walks  [{level}]", flush=True)
 
-    # ablation the reference ran: raw vs z-norm
+    # ablation: raw vs z-norm vs AS-norm (the reference progression)
     rows = []
-    for norm in ("none", "znorm"):
-        s, lab = cross_scores(f, y, fw, score_norm=norm)
+    for norm in ("none", "znorm", "asnorm"):
+        s, lab = cross_scores(f, y, fw, score_norm=norm, as_cohort=args.as_cohort)
         r = report_from_scores(s, lab)
         rows.append({"score_norm": norm, **{k: float(v) for k, v in r.items()}})
-        print(f"  score-norm={norm:5s}  EER {r['eer']*100:5.2f}  FMR100 {r['fmr100']*100:5.2f}  "
+        print(f"  score-norm={norm:6s}  EER {r['eer']*100:5.2f}  FMR100 {r['fmr100']*100:5.2f}  "
               f"BACC {r['balanced_accuracy']*100:5.2f}  ACC {r['accuracy']*100:5.2f}", flush=True)
         if wb is not None:
             wb.log({f"eer_{norm}": r["eer"], f"fmr100_{norm}": r["fmr100"],
                     f"bacc_{norm}": r["balanced_accuracy"]})
 
     # submission files at the chosen normalization, threshold = EER point (min-max -> [0,1])
-    s, lab = cross_scores(f, y, fw, score_norm=args.score_norm)
+    s, lab = cross_scores(f, y, fw, score_norm=args.score_norm, as_cohort=args.as_cohort)
     lo, hi = s.min(), s.max()
     s01 = (s - lo) / (hi - lo + 1e-9)
     from sklearn.metrics import roc_curve

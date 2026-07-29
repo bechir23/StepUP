@@ -44,6 +44,55 @@ class MixStyle(nn.Module):
         return xn * (sig * lmda + sig[perm] * (1 - lmda)) + (mu * lmda + mu[perm] * (1 - lmda))
 
 
+class DSU(nn.Module):
+    """Domain Shift with Uncertainty (Li et al., ICLR 2022). Model each channel's instance
+    mean/std as a Gaussian whose *scope* is the batch std of those statistics, resample new
+    stats via the reparameterization trick, and re-apply AdaIN-style. Footwear shifts these
+    per-channel statistics like 'style', so perturbing them during training makes the embedding
+    footwear-robust WITHOUT deleting identity -- and it is trained INTO the backbone (a frozen-
+    embedding head cannot replicate it). Parameter-free; off at eval, so it adds no state_dict keys."""
+
+    def __init__(self, p=0.5, eps=1e-6):
+        super().__init__()
+        self.p, self.eps = p, eps
+
+    def forward(self, x):
+        if not self.training or random.random() > self.p:
+            return x
+        dims = [2, 3, 4] if x.dim() == 5 else [2, 3]
+        mu = x.mean(dim=dims, keepdim=True)                     # (B,C,1,1) per-sample channel stats
+        sig = (x.var(dim=dims, keepdim=True) + self.eps).sqrt()
+        mu_std = mu.std(dim=0, keepdim=True) + self.eps         # (1,C,1,1) uncertainty scope
+        sig_std = sig.std(dim=0, keepdim=True) + self.eps       # = batch std of the statistics
+        beta = mu + torch.randn_like(mu) * mu_std               # resampled mean   (reparam)
+        gamma = sig + torch.randn_like(sig) * sig_std           # resampled std
+        xn = (x - mu.detach()) / sig.detach()
+        return gamma * xn + beta
+
+
+class HPP(nn.Module):
+    """Horizontal Pyramid Pooling (Fu et al. 2018; GaitSet, GaitPart, OpenGait -- and Salehi's
+    FootPart for THIS dataset). Split the feature map into horizontal strips (foot heel->arch->toe
+    regions) at several scales and pool each strip separately (avg+max), instead of one global
+    pool. Footwear changes some regions (arch/heel loading under a stiff sole) far more than others
+    (the toe/forefoot pressure signature, which is identity-specific and footwear-stable); a global
+    pool blends them, part-based pooling keeps the invariant regions able to carry identity. This is
+    the standard covariate-invariance lever in gait recognition ('clothing-invariant gait via
+    part-based features'). Output dim = C * sum(scales)."""
+
+    def __init__(self, scales=(1, 2, 4)):
+        super().__init__()
+        self.scales = scales
+
+    def forward(self, x):                                  # (B, C, H, W)
+        outs = []
+        for s in self.scales:
+            a = F.adaptive_avg_pool2d(x, (s, 1))           # split the foot-length axis into s strips
+            m = F.adaptive_max_pool2d(x, (s, 1))
+            outs.append((a + m).flatten(1))                # (B, C*s)   avg+max, GaitSet-style
+        return torch.cat(outs, 1)                          # (B, C*sum(scales))
+
+
 class SNR(nn.Module):
     """Style Normalisation and Restitution (Jin et al., CVPR 2020).
 
@@ -165,7 +214,8 @@ class GaitCNN(nn.Module):
     of the pressure map more than its structure, so mixing instance stats across the batch during
     training makes the embedding footwear-invariant. Off at eval. (Zhou et al. 2021.)"""
 
-    def __init__(self, in_frames=T, widths=(64, 128, 256, 256), mixstyle=False, norm="bn"):
+    def __init__(self, in_frames=T, widths=(64, 128, 256, 256), mixstyle=False, dsu=False,
+                 hpp=False, norm="bn"):
         super().__init__()
         # norm="in" swaps BatchNorm for InstanceNorm. BN normalises with batch statistics and so
         # PRESERVES each sample's own style; IN normalises per-sample per-channel and therefore
@@ -181,22 +231,26 @@ class GaitCNN(nn.Module):
         c0, c1, c2, c3 = widths
         ms1 = MixStyle() if mixstyle else nn.Identity()      # after stage 1
         ms2 = MixStyle() if mixstyle else nn.Identity()      # after stage 2
+        d1 = DSU() if dsu else nn.Identity()                 # DSU perturbs the same early stats
+        d2 = DSU() if dsu else nn.Identity()
         # norm="snr": keep BatchNorm inside the blocks (so identity discrimination is intact)
         # and insert SNR after the early/mid stages, where style lives.
         s1 = SNR(c0) if norm == "snr" else nn.Identity()
         s2 = SNR(c1) if norm == "snr" else nn.Identity()
         s3 = SNR(c2) if norm == "snr" else nn.Identity()
+        hpp_scales = (1, 2, 4)
+        pool = HPP(hpp_scales) if hpp else nn.AdaptiveAvgPool2d(1)   # part-based vs global pooling
         self.features = nn.Sequential(
-            blk(in_frames, c0), s1, ms1, nn.MaxPool2d(2), blk(c0, c1), s2, ms2, nn.MaxPool2d(2),
-            blk(c1, c2), s3, nn.MaxPool2d(2), blk(c2, c3), nn.AdaptiveAvgPool2d(1))
-        self.out_dim = c3
+            blk(in_frames, c0), s1, ms1, d1, nn.MaxPool2d(2), blk(c0, c1), s2, ms2, d2, nn.MaxPool2d(2),
+            blk(c1, c2), s3, nn.MaxPool2d(2), blk(c2, c3), pool)
+        self.out_dim = c3 * sum(hpp_scales) if hpp else c3
 
     def forward(self, x):
         return self.features(x.squeeze(1)).flatten(1)
 
 
-def make_gaitcnn(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False):
-    net = GaitCNN(in_frames=in_frames, mixstyle=mixstyle)
+def make_gaitcnn(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False, dsu=False, hpp=False):
+    net = GaitCNN(in_frames=in_frames, mixstyle=mixstyle, dsu=dsu, hpp=hpp)
     return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
 
 
@@ -207,10 +261,12 @@ def make_gaitcnn_in(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False):
     return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
 
 
-def make_gaitcnn_snr(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False):
+def make_gaitcnn_snr(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False, dsu=False, hpp=False):
     """GaitCNN + SNR modules: InstanceNorm-based style removal with identity restitution.
-    Targets the measured IN trade-off (better cross-footwear EER, worse rank-1)."""
-    net = GaitCNN(in_frames=in_frames, mixstyle=mixstyle, norm="snr")
+    Targets the measured IN trade-off (better cross-footwear EER, worse rank-1). --dsu adds
+    Domain-Shift-with-Uncertainty statistic perturbation on top of SNR (both attack footwear style).
+    --hpp swaps global pooling for Horizontal Pyramid (part-based) pooling of the foot regions."""
+    net = GaitCNN(in_frames=in_frames, mixstyle=mixstyle, dsu=dsu, hpp=hpp, norm="snr")
     return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
 
 
