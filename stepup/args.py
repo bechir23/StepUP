@@ -83,6 +83,10 @@ def add_common_args(ap):
                    help="Domain Shift with Uncertainty (Li ICLR'22): perturb per-channel feature "
                         "statistics during training so the backbone is footwear-robust. Trained IN "
                         "the backbone (a frozen-embedding head cannot replicate it). Off at eval.")
+    l.add_argument("--rl-augment", action="store_true", default=False,
+                   help="RL-learned GEOMETRIC augmentation policy (Adversarial-AutoAugment; the "
+                        "competition winners RL-searched rotation/flip). Co-evolves with the backbone "
+                        "during training. Use only for a from-scratch run; off by default.")
     l.add_argument("--hpp", action="store_true", default=False,
                    help="Horizontal Pyramid Pooling (Fu'18; GaitSet/GaitPart/FootPart): part-based "
                         "pooling of the foot heel->toe regions instead of one global pool, so "

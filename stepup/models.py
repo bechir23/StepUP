@@ -231,8 +231,6 @@ class GaitCNN(nn.Module):
         c0, c1, c2, c3 = widths
         ms1 = MixStyle() if mixstyle else nn.Identity()      # after stage 1
         ms2 = MixStyle() if mixstyle else nn.Identity()      # after stage 2
-        d1 = DSU() if dsu else nn.Identity()                 # DSU perturbs the same early stats
-        d2 = DSU() if dsu else nn.Identity()
         # norm="snr": keep BatchNorm inside the blocks (so identity discrimination is intact)
         # and insert SNR after the early/mid stages, where style lives.
         s1 = SNR(c0) if norm == "snr" else nn.Identity()
@@ -240,9 +238,16 @@ class GaitCNN(nn.Module):
         s3 = SNR(c2) if norm == "snr" else nn.Identity()
         hpp_scales = (1, 2, 4)
         pool = HPP(hpp_scales) if hpp else nn.AdaptiveAvgPool2d(1)   # part-based vs global pooling
-        self.features = nn.Sequential(
-            blk(in_frames, c0), s1, ms1, d1, nn.MaxPool2d(2), blk(c0, c1), s2, ms2, d2, nn.MaxPool2d(2),
-            blk(c1, c2), s3, nn.MaxPool2d(2), blk(c2, c3), pool)
+        # Build the stack as a list; DSU is only INSERTED when --dsu (so with dsu=False the module
+        # indices stay identical to the original -> pre-existing checkpoints still load).
+        feat = [blk(in_frames, c0), s1, ms1]
+        if dsu:
+            feat.append(DSU())
+        feat += [nn.MaxPool2d(2), blk(c0, c1), s2, ms2]
+        if dsu:
+            feat.append(DSU())
+        feat += [nn.MaxPool2d(2), blk(c1, c2), s3, nn.MaxPool2d(2), blk(c2, c3), pool]
+        self.features = nn.Sequential(*feat)
         self.out_dim = c3 * sum(hpp_scales) if hpp else c3
 
     def forward(self, x):
