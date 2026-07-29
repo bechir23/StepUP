@@ -9,9 +9,9 @@ GRM search, without a custom regressor). Optuna's study plots (optimization hist
 importance, slice, parallel-coordinate, intermediate-values) are written to artifacts/ and, if wandb
 is on, logged to one run.
 
-Round-1 space = the impactful knobs that are ALL already consumed by the pipeline (lr, weight_decay,
-arc_scale, dropout, embed_dim, label_smooth, K in 4..8, and the mixstyle/dsu/hpp architecture
-toggles). P is FIXED at 256 (the engine clamps it to the number of training identities).
+Search space = weight_decay, arc_scale, dropout, label_smooth, K in 4..8, and the mixstyle/dsu/hpp
+architecture toggles. FIXED (not searched): lr=1e-4, embed_dim=256, P=256 (the engine clamps P to the
+number of training identities).
 (margin_warmup_frac and channel widths are NOT searched yet -- the engine hardcodes the margin ramp
 and the gaitcnn_snr factory hardcodes widths; both need a 1-line change before they're searchable.)
 
@@ -38,11 +38,11 @@ def build_objective(ds, man, args):
         a = copy.deepcopy(args)                              # inherit the REAL run args (data cfg etc.)
         a.epochs = args.search_epochs                        # so the model matches the built dataset
         # ---- searched hyperparameters (all already consumed by build_cfg / the model) ----
-        a.lr = trial.suggest_float("lr", 1e-4, 3e-3, log=True)              # HIGH (the early-stop knob)
+        a.lr = 1e-4                                          # FIXED (not searched)
         a.weight_decay = trial.suggest_float("weight_decay", 1e-4, 5e-2, log=True)   # HIGH (reg)
         a.arc_scale = trial.suggest_categorical("arc_scale", [8, 16, 24, 32, 48, 64])  # HIGH
         a.dropout = trial.suggest_float("dropout", 0.0, 0.5)
-        a.embed_dim = trial.suggest_categorical("embed_dim", [64, 128, 256])
+        a.embed_dim = 256                                    # FIXED (not searched)
         a.label_smooth = trial.suggest_float("label_smooth", 0.0, 0.25)
         P = 256                                              # FIXED (engine clamps to #train IDs)
         K = trial.suggest_int("K", 4, 8)                     # steps per identity, 4..8
@@ -138,11 +138,13 @@ def main():
         run = wandb.init(project=args.wandb_project, entity=args.wandb_entity,
                          name=f"tune_{args.study_name}", mode=args.wandb, config=vars(args))
 
-    def log_trial(study, trial):                             # concise per-trial summary + wandb point
+    def log_trial(study, trial):                             # per-trial summary: state + combination
         v = f"{trial.value:.4f}" if trial.value is not None else "pruned"
         best = f"{study.best_value:.4f}" if study.best_trial is not None else "n/a"
-        print(f"[trial {trial.number:>3}/{args.trials}]  {trial.state.name:8s}  fit={v}  best={best}",
-              flush=True)
+        combo = "  ".join(f"{k}={round(x, 5) if isinstance(x, float) else x}"
+                          for k, x in trial.params.items())         # the sampled hyperparameters
+        print(f"[trial {trial.number:>3}/{args.trials}]  {trial.state.name:8s}  fit={v}  best={best}\n"
+              f"        {combo}", flush=True)                        # PRUNED trials also show their combo
         if run is not None:
             run.log({"trial": trial.number,
                      "trial_value": (trial.value if trial.value is not None else float("nan")),
