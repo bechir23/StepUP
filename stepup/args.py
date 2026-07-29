@@ -79,6 +79,15 @@ def add_common_args(ap):
                    help="MixStyle in the backbone: mixes per-sample feature statistics (which carry "
                         "footwear) across the batch. On by default -- improved every metric.")
     l.add_argument("--no-mixstyle", dest="mixstyle", action="store_false")
+    l.add_argument("--dsu", action="store_true", default=False,
+                   help="Domain Shift with Uncertainty (Li ICLR'22): perturb per-channel feature "
+                        "statistics during training so the backbone is footwear-robust. Trained IN "
+                        "the backbone (a frozen-embedding head cannot replicate it). Off at eval.")
+    l.add_argument("--hpp", action="store_true", default=False,
+                   help="Horizontal Pyramid Pooling (Fu'18; GaitSet/GaitPart/FootPart): part-based "
+                        "pooling of the foot heel->toe regions instead of one global pool, so "
+                        "footwear-stable regions (toes) carry identity separately from footwear-"
+                        "sensitive ones (arch/heel). Changes embed input dim -> train from scratch.")
 
     w = ap.add_argument_group("logging")
     w.add_argument("--wandb", default="disabled", choices=["online", "offline", "disabled"])
