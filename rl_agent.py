@@ -39,6 +39,10 @@ def load_backbone(model, ckpt, hf_repo, hf_token, in_frames=0, tag=""):
     if not os.path.exists(ckpt or ""):
         ckpt = str(ARTIFACTS / fname)
     if not os.path.exists(ckpt):
+        if not hf_repo:
+            raise FileNotFoundError(
+                f"backbone checkpoint '{fname}' not found in {ARTIFACTS} and no --hf-repo to fetch it "
+                f"from. Train Stage 1 first (saves {fname} after all epochs), or pass --hf-repo.")
         from stepup.hf import fetch_file
         ckpt = fetch_file(hf_repo, fname, hf_token)
         print(f"fetched checkpoint from HF: {ckpt}", flush=True)
@@ -123,15 +127,15 @@ def running_states(f, m, max_k, agg=None):
 
 # ---------------- the halting policy (EARLIEST controller) ----------------
 class HaltPolicy(nn.Module):
-    def __init__(self, d_state=5, hidden=32):
+    def __init__(self, d_state=5, hidden=32, halt_bias=-1.0):
         super().__init__()
         self.body = nn.Sequential(nn.Linear(d_state, hidden), nn.ReLU(),
                                   nn.Linear(hidden, hidden), nn.ReLU())
         self.halt = nn.Linear(hidden, 1)        # P(halt now)
         self.value = nn.Linear(hidden, 1)       # baseline for REINFORCE variance reduction
-        nn.init.constant_(self.halt.bias, -2.5)  # start by WAITING (p_halt~0.08) -> explores full
-        #                                          walks and discovers the accuracy reward; without
-        #                                          this, REINFORCE collapses to "halt at step 1".
+        nn.init.constant_(self.halt.bias, halt_bias)  # <0 starts by WAITING (explores full walks so
+        #   REINFORCE doesn't collapse to halt-at-1); but too negative + a long warmup makes it
+        #   OVER-wait. -1.0 (p_halt~0.27) balances both; tune with --halt-bias.
 
     def forward(self, s):
         h = self.body(s)
@@ -223,12 +227,20 @@ def main():
     ap.add_argument("--pack-device", default="", choices=["", "cuda", "memmap", "cpu"],
                     help="override the checkpoint's pack device (cuda = fast eval on Colab)")
     ap.add_argument("--hf-repo", default=None); ap.add_argument("--hf-token", default=None)
+    ap.add_argument("--hf-offload", action="store_true",
+                    help="after pushing to HF, delete the local .pt (keep parquet); use on Colab to "
+                         "keep Drive light -- locally omit it so the policy stays, as before")
     ap.add_argument("--max-steps", type=int, default=10, help="longest walk the policy may observe")
     ap.add_argument("--episodes", type=int, default=40, help="training epochs over the walk set")
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--lam", "--lambda", dest="lam", type=float, default=0.02,
+    ap.add_argument("--lam", "--lambda", dest="lam", type=float, default=0.05,
                     help="earliness penalty (per footstep); higher = halt sooner")
+    ap.add_argument("--warmup-frac", type=float, default=0.1,
+                    help="fraction of episodes to ramp lambda 0->target (short: just enough to learn "
+                         "accuracy before penalizing steps; too long -> over-waits)")
+    ap.add_argument("--halt-bias", type=float, default=-1.0,
+                    help="init halt-head bias; <0 = start waiting (explore). -1.0 ~ p_halt 0.27")
     ap.add_argument("--ks", default=DEF_KS, help="fixed-k baselines to report")
     ap.add_argument("--wandb", default="disabled", choices=["disabled", "online", "offline"])
     args = ap.parse_args()
@@ -258,10 +270,11 @@ def main():
     sub = lambda keys, ix: {k: data[k][ix] for k in keys}
     train = sub(data.keys(), tr); test = sub(data.keys(), te)
 
-    policy = HaltPolicy(d_state=5).to(dev)
+    policy = HaltPolicy(d_state=5, halt_bias=args.halt_bias).to(dev)
     opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
-    print(f"training halting policy (REINFORCE, lambda={args.lam}) ...", flush=True)
-    warmup = max(1, args.episodes // 3)
+    print(f"training halting policy (REINFORCE, lambda={args.lam}, warmup={args.warmup_frac}, "
+          f"halt_bias={args.halt_bias}) ...", flush=True)
+    warmup = max(1, int(args.episodes * args.warmup_frac))
     for ep in range(args.episodes):
         lam_ep = args.lam * min(1.0, ep / warmup)      # warmup: learn accuracy first, then penalize
         policy.train()
@@ -306,15 +319,29 @@ def main():
         wb.log({"final_rl_acc": rl_acc, "final_rl_steps": rl_steps, "final_rl_hm": rl_hm,
                 **{f"fixedk_acc_k{k}": a for k, (a, _) in fk.items()}})
         wb.finish()
-    out = ARTIFACTS / f"rl_{args.model}_lam{args.lam}.pt"
+    otag = f"_{args.tag}" if args.tag else ""            # include tag so 12/25-ID runs don't collide
+    stem = f"rl_{args.model}{otag}_lam{args.lam}"
+    out = ARTIFACTS / f"{stem}.pt"
     torch.save(dict(state=policy.state_dict(), lam=args.lam, max_steps=args.max_steps,
                     rl=(rl_acc, rl_steps, rl_hm), fixed_k=fk, sprt=sp, model=args.model, tag=args.tag),
                out)
-    print(f"\nsaved policy -> {out}", flush=True)
+    # Python-readable frontier parquet (RL + every fixed-k + every SPRT tau) for analysis/plots
+    import pandas as pd
+    rows = [{"method": "RL", "param": args.lam, "acc": rl_acc, "avg_steps": rl_steps, "hm": rl_hm}]
+    rows += [{"method": "fixed_k", "param": k, "acc": a, "avg_steps": st,
+              "hm": harmonic_mean(a, st, args.max_steps)} for k, (a, st) in fk.items()]
+    rows += [{"method": "sprt", "param": tau, "acc": a, "avg_steps": st,
+              "hm": harmonic_mean(a, st, args.max_steps)} for tau, (a, st) in sp.items()]
+    fr_f = ARTIFACTS / f"{stem}.parquet"
+    pd.DataFrame(rows).to_parquet(fr_f, index=False)
+    print(f"\nsaved policy -> {out.name}   frontier -> {fr_f.name}", flush=True)
     if args.hf_repo:
         from stepup.hf import push_files
-        push_files(args.hf_repo, [out], args.hf_token)
-        print(f"pushed policy -> https://huggingface.co/{args.hf_repo}", flush=True)
+        push_files(args.hf_repo, [out, fr_f], args.hf_token)
+        print(f"pushed policy + frontier -> https://huggingface.co/{args.hf_repo}", flush=True)
+        if args.hf_offload:                              # Colab: drop the heavy .pt locally, keep parquet
+            out.unlink(missing_ok=True)
+            print(f"  offloaded {out.name} (removed local copy; on HF)", flush=True)
 
 
 if __name__ == "__main__":

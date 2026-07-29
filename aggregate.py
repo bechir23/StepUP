@@ -55,34 +55,45 @@ class SAB(nn.Module):
 
 class WalkAggregator(nn.Module):
     """Set-Transformer aggregator: SAB self-attention + PMA pooling (Lee et al., ICML 2019).
-    Set of N step embeddings (B,N,D) -> one L2-normalised walk embedding (B,D)."""
+    Set of N step embeddings (B,N,D) -> one L2-normalised walk embedding (B,D).
+
+    Mean-pool residual (NAN trick, Yang CVPR'17): output = mean(x) + gate*(PMA(x) - mean(x)) with
+    gate INIT 0, so the aggregator STARTS exactly at mean pooling and training can only deviate if
+    it lowers the loss -> the learned head can never underperform the mean baseline at init."""
     def __init__(self, d=64, h=4, depth=1):
         super().__init__()
         self.enc = nn.Sequential(*[SAB(d, h) for _ in range(depth)])
         self.seed = nn.Parameter(torch.randn(1, 1, d))
         self.pool = MAB(d, h)
+        self.gate = nn.Parameter(torch.zeros(1))             # 0 = pure mean pooling at init
 
     def forward(self, x):                                    # x: (B, N, D)
-        x = self.enc(x)
-        w = self.pool(self.seed.expand(x.size(0), -1, -1), x).squeeze(1)
-        return F.normalize(w, dim=-1)
+        base = x.mean(1)                                     # mean-pool baseline
+        h = self.enc(x)
+        w = self.pool(self.seed.expand(x.size(0), -1, -1), h).squeeze(1)
+        return F.normalize(base + self.gate * (w - base), dim=-1)
 
 
 class NANAggregator(nn.Module):
     """Neural Aggregation Network head (Yang et al., CVPR 2017): TWO cascaded dot-product
     attention blocks (no self-attention). q0 init at zero = average pooling; the second block's
-    query is content-adapted q1=tanh(W r0). The reference architecture, so we can ablate it vs PMA."""
+    query is content-adapted q1=tanh(W r0). Same mean-pool residual gate (init 0) so it starts as
+    mean pooling. The reference architecture, so we can ablate it vs PMA."""
     def __init__(self, d=64):
         super().__init__()
         self.q0 = nn.Parameter(torch.zeros(d))               # starts from average pooling
         self.W = nn.Linear(d, d)
+        nn.init.zeros_(self.W.weight); nn.init.zeros_(self.W.bias)   # q1=0 -> a1 uniform -> mean
+        self.gate = nn.Parameter(torch.zeros(1))             # 0 = pure mean pooling at init
 
     def forward(self, x):                                    # x: (B, N, D)
-        a0 = torch.softmax(x @ self.q0, dim=1)               # (B, N)
+        base = x.mean(1)
+        a0 = torch.softmax(x @ self.q0, dim=1)               # (B, N); q0=0 -> uniform -> r0=mean
         r0 = (a0.unsqueeze(-1) * x).sum(1)                   # (B, D)
         q1 = torch.tanh(self.W(r0))                          # content-adapted query
         a1 = torch.softmax((x * q1.unsqueeze(1)).sum(-1), dim=1)
-        return F.normalize((a1.unsqueeze(-1) * x).sum(1), dim=-1)
+        pooled = (a1.unsqueeze(-1) * x).sum(1)
+        return F.normalize(base + self.gate * (pooled - base), dim=-1)
 
 
 def make_aggregator(kind, d):
@@ -95,6 +106,11 @@ def load_backbone(model, ckpt, hf_repo, hf_token, in_frames=0, tag=""):
     if not os.path.exists(ckpt or ""):
         ckpt = str(ARTIFACTS / fname)
     if not os.path.exists(ckpt):
+        if not hf_repo:
+            raise FileNotFoundError(
+                f"backbone checkpoint '{fname}' not found in {ARTIFACTS} and no --hf-repo to fetch "
+                f"it from. Train Stage 1 first (it saves {fname} only after all epochs finish), or "
+                f"pass --hf-repo to pull it from HF.")
         from stepup.hf import fetch_file
         ckpt = fetch_file(hf_repo, fname, hf_token)
         print(f"fetched checkpoint from HF: {ckpt}", flush=True)
@@ -143,13 +159,24 @@ def train_aggregator(agg, f, m, fva, mva, k, ids, id2c, epochs, P, M, lr, wd, su
     LEARNED aggregator vs the frozen MEAN-pool baseline, keep the BEST epoch by val rank-1, and
     early-stop on patience -- so we never ship the over-trained last epoch (low loss != best eval)."""
     import copy
-    pools = {i: np.where(m.ParticipantID.to_numpy() == i)[0] for i in ids}
+    from collections import defaultdict
+    # SINGLE-FOOTWEAR training walks (match the eval/deployment protocol: a walk is one shoe).
+    # pool steps by (identity, footwear); each training walk = k steps drawn from ONE (id, shoe).
+    pidc, fwc = m.ParticipantID.to_numpy(), m.Footwear.to_numpy()
+    fw_pool = defaultdict(list)
+    for j in range(len(m)):
+        fw_pool[(pidc[j], fwc[j])].append(j)
+    fw_pool = {kk: np.asarray(v) for kk, v in fw_pool.items()}
+    id_shoes = defaultdict(list)                                    # which shoes each id actually has
+    for (pid, fw) in fw_pool:
+        id_shoes[pid].append(fw)
+    n_steps = sum(len(v) for v in fw_pool.values())
     loss_fn = losses.SubCenterArcFaceLoss(num_classes=len(ids), embedding_size=f.shape[1],
                                           sub_centers=sub_centers).to(dev)
     opt = torch.optim.AdamW(list(agg.parameters()) + list(loss_fn.parameters()), lr=lr,
                             weight_decay=wd)
     rng = np.random.default_rng(0)
-    steps = max(1, sum(len(v) for v in pools.values()) // (P * M * k))
+    steps = max(1, n_steps // (P * M * k))
 
     # VAL windows + the MEAN-pool baseline are fixed (frozen backbone) -> compute once.
     vwin = walk_windows(mva, k)
@@ -159,16 +186,20 @@ def train_aggregator(agg, f, m, fva, mva, k, ids, id2c, epochs, P, M, lr, wd, su
           f"rank5 {base['rank5']:.3f} EER {base['eer']:.3f} TAR@1% {base['tar1']:.3f} "
           f"auc {base['auc']:.3f} aupr {base['aupr']:.3f}", flush=True)
 
-    best = dict(val=-float("inf"), state=copy.deepcopy(agg.state_dict()), epoch=-1, m=base)
+    # FLOOR the selection at the mean-pool baseline: the init state is gate=0 (== mean pooling), so
+    # a learned epoch is only kept if it BEATS mean on val rank-1; otherwise we ship exact mean.
+    best = dict(val=base["rank1"], state=copy.deepcopy(agg.state_dict()), epoch=0, m=base)
     bad = 0
     for ep in range(epochs):
         agg.train(); tot = 0.0
         for _ in range(steps):
             bx, by = [], []
             for i in rng.choice(ids, min(P, len(ids)), replace=False):     # P identities
-                idx = pools[i]
-                for _ in range(M):                                          # M walks each
-                    sel = idx[rng.integers(0, len(idx), k)]                 # k random steps (mix shoes)
+                shoes = id_shoes[i]
+                for _ in range(M):                                          # M single-shoe walks each
+                    fw = shoes[rng.integers(len(shoes))]                    # pick ONE shoe
+                    pool = fw_pool[(i, fw)]                                 # steps of this id in that shoe
+                    sel = pool[rng.integers(0, len(pool), k)]              # k steps from the SAME shoe
                     bx.append(f[sel]); by.append(id2c[i])
             xb = torch.stack(bx).to(dev)                                    # (P*M, k, D)
             w = agg(xb)
@@ -295,6 +326,9 @@ def main():
     ap.add_argument("--pack-device", default="", choices=["", "cuda", "memmap", "cpu"], help="override the checkpoint's pack device (cuda = fast eval on Colab)")
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--hf-repo", default=None); ap.add_argument("--hf-token", default=None)
+    ap.add_argument("--hf-offload", action="store_true",
+                    help="after pushing to HF, delete the local .pt (keep parquets); use on Colab to "
+                         "keep Drive light -- locally omit it so the checkpoint stays, as before")
     ap.add_argument("--k", type=int, default=DEF_WALK_K, help="steps per walk the aggregator is trained on")
     ap.add_argument("--ks", default=DEF_KS, help="k-curve to report")
     ap.add_argument("--sub-centers", type=int, default=DEF_SUB_CENTERS)
@@ -318,7 +352,9 @@ def main():
         cfg["pack_device"] = args.pack_device   # override (cuda = fast on Colab, memmap = low RAM)
     _, ds = build_datasets(cfg)
     ftr, mtr = frozen(net, ds["train"])
-    fva, mva = frozen(net, ds["val_mon"])                # held-out VAL ids (unseen): per-epoch selection
+    fva, mva = frozen(net, ds["val"])                    # FULL val ids (unseen): per-epoch selection
+    #   NB: use ds["val"], NOT ds["val_mon"] -- val_mon is a random SUBSAMPLE that breaks the
+    #   consecutive-footstep structure walk_windows() needs, giving empty walks -> NaN metrics.
     fte, mte = frozen(net, ds["test"])                   # held-out TEST ids (unseen): final report only
     D = ftr.shape[1]
     print(f"backbone loaded: embed_dim={D}  train steps={len(mtr)}  val steps={len(mva)}  "
@@ -363,16 +399,28 @@ def main():
               f"delta {r_lrn - r_mean:+.3f}", flush=True)
         if wb is not None:
             wb.log({f"test_rank1_mean_k{k}": r_mean, f"test_rank1_learned_k{k}": r_lrn, "k": k})
-    ckpt_out = ARTIFACTS / f"agg_{args.model}_{args.aggregator}_K{args.sub_centers}.pt"
+    otag = f"_{args.tag}" if args.tag else ""            # keep runs from different backbones distinct
+    stem = f"agg_{args.model}{otag}_{args.aggregator}_K{args.sub_centers}"
+    ckpt_out = ARTIFACTS / f"{stem}.pt"
     torch.save(dict(state=best["state"], aggregator=args.aggregator, sub_centers=args.sub_centers,
                     k=args.k, embed_dim=D, model=args.model, tag=args.tag, best_epoch=best["epoch"],
                     val_metrics=best["m"], test_mean=tm_mean, test_learned=tm_lrn, test_kcurve=kcurve),
                ckpt_out)
-    print(f"\nsaved aggregator (best epoch {best['epoch']}) -> {ckpt_out}", flush=True)
-    if args.hf_repo:                                     # offload to HF like train.py
+    # Python-readable parquets for later analysis/plots (same convention as Stage 1's parquets):
+    import pandas as pd
+    met_f = ARTIFACTS / f"{stem}.parquet"                # walk metrics: one row per pool
+    pd.DataFrame([{"pool": "mean", **tm_mean}, {"pool": "learned", **tm_lrn}]).to_parquet(met_f, index=False)
+    acc_f = ARTIFACTS / f"acc_{stem}.parquet"            # accumulated rank-1 k-curve
+    pd.DataFrame([{"k": k, "mean": m, "learned": l} for k, (m, l) in kcurve.items()]).to_parquet(acc_f, index=False)
+    print(f"\nsaved aggregator (best epoch {best['epoch']}) -> {ckpt_out}\n"
+          f"  metrics -> {met_f.name}   k-curve -> {acc_f.name}", flush=True)
+    if args.hf_repo:                                     # push like train.py (metrics parquets too)
         from stepup.hf import push_files
-        push_files(args.hf_repo, [ckpt_out], args.hf_token)
-        print(f"pushed aggregator -> https://huggingface.co/{args.hf_repo}", flush=True)
+        push_files(args.hf_repo, [ckpt_out, met_f, acc_f], args.hf_token)
+        print(f"pushed aggregator + metrics -> https://huggingface.co/{args.hf_repo}", flush=True)
+        if args.hf_offload:                              # Colab: drop the heavy .pt locally, keep parquets
+            ckpt_out.unlink(missing_ok=True)
+            print(f"  offloaded {ckpt_out.name} (removed local copy; on HF)", flush=True)
     if wb is not None:
         wb.finish()
 
