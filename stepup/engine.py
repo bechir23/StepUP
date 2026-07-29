@@ -157,8 +157,9 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
         crit.set_margin_frac((epoch + 1) / margin_warmup)   # ArcFace margin ramp (no-op for CE)
         net.train(); crit.train()
         ep_loss, ep_id, ep_tri, ep_gn = [], [], [], []
-        steps = tqdm(epoch_batches(), total=steps_per_epoch, leave=False, disable=None,
-                     desc=f"{tag} ep {epoch + 1}/{max_epochs}")   # disable=None: off on non-TTY
+        show_bar = os.environ.get("STEPUP_PROGRESS") == "1"   # per-step bar OFF by default (Colab spam);
+        steps = tqdm(epoch_batches(), total=steps_per_epoch, leave=False, disable=not show_bar,
+                     desc=f"{tag} ep {epoch + 1}/{max_epochs}")   # set STEPUP_PROGRESS=1 to show it
 
         for xb, yb, fwb in steps:
             set_schedule(gstep)                              # YOLO-style per-iteration LR + momentum

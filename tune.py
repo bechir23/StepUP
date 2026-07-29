@@ -20,6 +20,7 @@ and the gaitcnn_snr factory hardcodes widths; both need a 1-line change before t
 import argparse
 import copy
 import gc
+import os
 
 import optuna
 import torch
@@ -117,6 +118,7 @@ def main():
                     help="epochs per trial during search (reduced); retrain the winner at full epochs")
     ap.add_argument("--study-name", default="gaitcnn_snr")
     args = apply_smoke(ap.parse_args())
+    optuna.logging.set_verbosity(optuna.logging.WARNING)     # silence per-trial INFO (log_trial covers it)
 
     cfg0 = build_cfg(args)
     man, ds = build_datasets(cfg0)                           # build the pack ONCE; reuse every trial
@@ -151,8 +153,8 @@ def main():
                      "best_value": (study.best_value if study.best_trial is not None else float("nan"))})
 
     objective = build_objective(ds, man, args)
-    study.optimize(objective, n_trials=args.trials, callbacks=[log_trial],
-                   show_progress_bar=True)                   # tqdm bar over trials (per-epoch bar is inside)
+    study.optimize(objective, n_trials=args.trials, callbacks=[log_trial],   # log_trial = clean per-trial
+                   show_progress_bar=os.environ.get("STEPUP_PROGRESS") == "1")   # bar off by default
 
     print("\n=== BEST ===")
     print(f"  value : {study.best_value:.4f}")
