@@ -31,7 +31,6 @@ from stepup.data import build_datasets
 from stepup.engine import train
 from stepup.models import registry, set_dropout
 
-MODEL = "gaitcnn_snr"
 
 
 def build_objective(ds, man, args):
@@ -56,7 +55,7 @@ def build_objective(ds, man, args):
         data_t = (cfg["sample3d"] or cfg["pack_res"] or (T, H, W))[0]
         if cfg.get("stride_pairs"):
             data_t *= 2
-        spec = registry(cfg["sample3d"], data_t)[MODEL]
+        spec = registry(cfg["sample3d"], data_t)[args.model]
         cfg["lr_mult"] = spec.get("lr_mult", 1.0)
         mkw = dict(spec["kw"]); mkw.update(toggles)          # gaitcnn_snr honours mixstyle/dsu/hpp
         steps = cfg["steps_per_epoch"] or max(1, len(man["train"]) // (P * K))
@@ -116,6 +115,7 @@ def main():
     ap.add_argument("--trials", type=int, default=40)
     ap.add_argument("--search-epochs", type=int, default=60,
                     help="epochs per trial during search (reduced); retrain the winner at full epochs")
+    ap.add_argument("--model", default="gaitcnn_snr", help="backbone to tune (registry name, e.g. gaitcnn_r21d)")
     ap.add_argument("--study-name", default="gaitcnn_snr")
     args = apply_smoke(ap.parse_args())
     optuna.logging.set_verbosity(optuna.logging.WARNING)     # silence per-trial INFO (log_trial covers it)
@@ -168,7 +168,10 @@ def main():
                 flags.append(f"--{k}" if v else "")          # dsu / hpp default False -> only add when True
         else:
             flags.append(f"--{k.replace('_', '-')} {v}")
-    cmd = f"python train.py --model {MODEL} " + " ".join(f for f in flags if f)
+    # include the FIXED values explicitly, else train.py falls back to its own defaults (lr=1e-3,
+    # embed_dim=128) and silently retrains a different model than the search found.
+    cmd = (f"python train.py --model {args.model} --lr 1e-4 --embed-dim 256 --P 256 "
+           + " ".join(f for f in flags if f))
     print(f"  retrain the winner at full epochs:\n    {cmd}")
     save_plots(study, run)
     if run is not None:

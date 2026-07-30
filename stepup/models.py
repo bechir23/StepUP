@@ -285,6 +285,71 @@ def make_gaitcnn_tiny(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False
     return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
 
 
+class R21DBlock(nn.Module):
+    """Factorised (2+1)D convolution (Tran et al., CVPR 2018, 'A Closer Look at Spatiotemporal
+    Convolutions'): a 2D spatial conv (1,3,3) over the pressure map, then a 1D temporal conv (3,1,1)
+    over the gait cycle, each BN+ReLU. Learns the spatial and temporal filters SEPARATELY -- models
+    footstep dynamics (which the time-as-channels GaitCNN discards) at ~1/3 the FLOPs of a full 3D
+    (3,3,3) conv, and the extra ReLU between them adds nonlinearity a single 3D conv lacks."""
+
+    def __init__(self, cin, cout, mid=None):
+        super().__init__()
+        mid = mid or cout
+        self.spatial = nn.Conv3d(cin, mid, (1, 3, 3), padding=(0, 1, 1), bias=False)
+        self.bn1 = nn.BatchNorm3d(mid)
+        self.temporal = nn.Conv3d(mid, cout, (3, 1, 1), padding=(1, 0, 0), bias=False)
+        self.bn2 = nn.BatchNorm3d(cout)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.act(self.bn1(self.spatial(x)))
+        return self.act(self.bn2(self.temporal(x)))
+
+
+class GaitR21D(nn.Module):
+    """Lightweight (2+1)D backbone for the pressure cube (B,1,T,H,W): 4 factorised spatiotemporal
+    blocks that keep the gait DYNAMICS the time-as-channels GaitCNN throws away, far cheaper than a
+    full-3D net (which needs a downsized clip and OOMs on the full cube). Same footwear-invariance
+    hooks as GaitCNN: norm='snr' inserts SNR3d after the early stages; mixstyle/dsu perturb per-sample
+    feature statistics (5D-aware); hpp does part-based heel->toe pooling after a temporal collapse."""
+
+    def __init__(self, widths=(32, 64, 128, 128), mixstyle=False, dsu=False, hpp=False, norm="snr"):
+        super().__init__()
+        c0, c1, c2, c3 = widths
+        ms1 = MixStyle() if mixstyle else nn.Identity()
+        ms2 = MixStyle() if mixstyle else nn.Identity()
+        s1 = SNR3d(c0) if norm == "snr" else nn.Identity()   # style removal after early stages only
+        s2 = SNR3d(c1) if norm == "snr" else nn.Identity()
+        s3 = SNR3d(c2) if norm == "snr" else nn.Identity()
+        sp = lambda: nn.MaxPool3d((1, 2, 2), ceil_mode=True)   # spatial-only downsample
+        spt = lambda: nn.MaxPool3d((2, 2, 2), ceil_mode=True)  # spatial + temporal downsample
+        feat = [R21DBlock(1, c0), s1, ms1]                     # input channel = 1 (single pressure map)
+        if dsu:
+            feat.append(DSU())
+        feat += [sp(), R21DBlock(c0, c1), s2, ms2]
+        if dsu:
+            feat.append(DSU())
+        feat += [spt(), R21DBlock(c1, c2), s3, spt(), R21DBlock(c2, c3)]
+        self.features = nn.Sequential(*feat)
+        self.hpp, self.scales = hpp, (1, 2, 4)
+        self.pool = HPP(self.scales) if hpp else None
+        self.out_dim = c3 * sum(self.scales) if hpp else c3
+
+    def forward(self, x):                                      # (B,1,T,H,W)
+        h = self.features(x)                                   # (B,c3,T',H',W')
+        if self.hpp:
+            return self.pool(h.mean(2))                        # temporal-pool -> part-based spatial pool
+        return F.adaptive_avg_pool3d(h, 1).flatten(1)          # global (T,H,W) pool -> (B,c3)
+
+
+def make_gaitcnn_r21d(embed_dim=128, n_classes=None, in_frames=T, mixstyle=False, dsu=False, hpp=False):
+    """Factorised (2+1)D GaitCNN + SNR: spatial-2D-then-temporal-1D convs model the footstep dynamics
+    the time-as-channels GaitCNN drops, at ~1/3 the cost of full 3D. --mixstyle/--dsu/--hpp behave as
+    in gaitcnn_snr. Consumes the same (B,1,T,H,W) pressure pack as the 2D nets (no clip resize)."""
+    net = GaitR21D(mixstyle=mixstyle, dsu=dsu, hpp=hpp, norm="snr")   # in_frames unused (T is dynamic)
+    return Embedder(net, feat_dim=net.out_dim, embed_dim=embed_dim, n_classes=n_classes)
+
+
 def make_resnet2d_snr(embed_dim=128, n_classes=None, in_frames=T):
     """ResNet-2D with SNR after stages 1-2 -- the same footwear-style removal as gaitcnn_snr, so
     the backbones can be compared with the invariance mechanism held constant."""
@@ -517,6 +582,8 @@ def registry(sample3d, data_t=T):
                              smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "gaitcnn_snr": dict(fn=make_gaitcnn_snr, kw=dict(in_frames=data_t), full_pk=pk2d,
                             smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "gaitcnn_r21d": dict(fn=make_gaitcnn_r21d, kw=dict(in_frames=data_t), full_pk=pk2d,
+                             smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "gaitcnn_in": dict(fn=make_gaitcnn_in, kw=dict(in_frames=data_t), full_pk=pk2d,
                            smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "gaitcnn_tiny": dict(fn=make_gaitcnn_tiny, kw=dict(in_frames=data_t), full_pk=pk2d,
@@ -559,8 +626,8 @@ def registry(sample3d, data_t=T):
         spec["lr_mult"] = 1.0
     for n in ("gaitcnn", "gaitcnn_in", "gaitcnn_snr", "resnet2d_snr", "gaitcnn_deep", "gaitcnn_tiny", "resnet2d", "resnet2d_light", "cnnlstm"):
         reg[n]["lr_mult"] = 0.4                           # 2D CNNs: 2e-3 -> ~8e-4 at batch 512
-    for n in ("r2plus1d", "r2plus1d_snr", "r2plus1d_light", "r3d", "r3d_light"):
-        reg[n]["lr_mult"] = 0.35                          # video ResNets: peak ~5e-4 at batch 256
+    for n in ("r2plus1d", "r2plus1d_snr", "r2plus1d_light", "r3d", "r3d_light", "gaitcnn_r21d"):
+        reg[n]["lr_mult"] = 0.35                          # video ResNets + (2+1)D: peak ~5e-4 at batch 256
     for n in ("swin3d", "swin3d_light", "vit"):
         reg[n]["lr_mult"] = 0.2                           # transformers: gentler still
     reg["convnext"]["lr_mult"] = 0.5                       # ConvNeXt (28M) also wants a gentler LR
