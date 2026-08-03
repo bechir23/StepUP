@@ -304,7 +304,11 @@ def main():
     ds_test = ds["test"]; ds_calib = ds.get("val") or ds.get("val_mon") or ds["train"]
     x0 = ds_test[0][0]                                      # one real footstep -> exact input shape
     dummy = x0.unsqueeze(0).to(dev)
-    print(f"quantize {args.model}  input {tuple(dummy.shape)}  test {len(ds_test)} steps", flush=True)
+    # 2D backbones consume the cube as frames-as-channels (squeeze the singleton dim); show that
+    # effective 2D shape (B, frames, H, W) rather than the 5D storage wrapper. 3D nets keep the 5D.
+    _3d = ("r2plus1d", "r3d", "swin3d", "vit")
+    _shape = tuple(dummy.shape) if args.model.startswith(_3d) else tuple(dummy.squeeze(1).shape)
+    print(f"quantize {args.model}  input {_shape}  test {len(ds_test)} steps", flush=True)
     rows = run_all(net, ds_test, ds_calib, dummy, args.out, dev, calib_n=args.calib, do_adabn=args.adabn)
 
     if args.wandb != "disabled":                       # optional: mirror the table + plots to wandb

@@ -49,15 +49,32 @@ def bdcspn_rectify(protos, query, z=8, scale=10.0):
     return F.normalize(new, dim=1), q
 
 
+RANKS = (1, 3, 5)
+
+
+def _rank_hits(sim, pid, qy, ranks=RANKS):
+    """Top-r identification membership: for each probe, is its true identity among the r
+    nearest (highest-similarity) prototypes? Same ranking as rank-1, just top-r membership.
+    Returns {r: bool array over probes}. r is clipped to the #prototypes available."""
+    order = np.argsort(-sim, axis=1)                       # prototypes by descending similarity
+    ranked_ids = pid[order]                                # (Q, G) prototype ids in rank order
+    hits = {}
+    for r in ranks:
+        rr = min(r, ranked_ids.shape[1])
+        hits[r] = (ranked_ids[:, :rr] == qy[:, None]).any(1)
+    return hits
+
+
 def cross_fw_eval(f, y, fw, k, method="ncm", z=8, rng=None, FOOTWEAR=None):
     """Enroll each identity from ONE footwear (k steps), identify its OTHER-footwear steps.
-    Returns pooled genuine/impostor scores + labels (for EER) AND rank-1 identification accuracy
-    (the natural 'did we name the right person' metric -- BD-CSPN plots this)."""
+    Returns pooled genuine/impostor scores + labels (for EER) AND rank-1/3/5 identification
+    accuracy (the natural 'did we name the right person' metric -- BD-CSPN plots this)."""
     rng = rng or np.random.default_rng(0)
     fu = preprocess(f, method)
     ids = np.unique(y)
     S, L = [], []
-    correct = total = 0
+    hit = {r: 0 for r in RANKS}
+    total = 0
     for A in FOOTWEAR:
         g = fw == A
         if g.sum() == 0:
@@ -78,8 +95,12 @@ def cross_fw_eval(f, y, fw, k, method="ncm", z=8, rng=None, FOOTWEAR=None):
             P, qf = bdcspn_rectify(P, qf, z=z)
         sim = (F.normalize(qf) @ F.normalize(P).t()).numpy()
         S.append(sim.ravel()); L.append((pid[None, :] == qy[:, None]).ravel())
-        correct += int((pid[sim.argmax(1)] == qy).sum()); total += len(qy)   # rank-1 identification
-    return np.concatenate(S), np.concatenate(L), correct / max(total, 1)
+        h = _rank_hits(sim, pid, qy)                        # rank-1/3/5 identification
+        for r in RANKS:
+            hit[r] += int(h[r].sum())
+        total += len(qy)
+    accs = tuple(hit[r] / max(total, 1) for r in RANKS)     # (rank1, rank3, rank5)
+    return np.concatenate(S), np.concatenate(L), accs
 
 
 def cross_fw_scores(f, y, fw, k, method="ncm", z=8, rng=None, FOOTWEAR=None):
@@ -89,16 +110,17 @@ def cross_fw_scores(f, y, fw, k, method="ncm", z=8, rng=None, FOOTWEAR=None):
 
 def metrics_at(f, y, fw, k, method, z, rng, FOOTWEAR):
     from stepup.metrics import report_from_scores
-    s, l, r1 = cross_fw_eval(f, y, fw, k, method, z, rng, FOOTWEAR)
-    return report_from_scores(s, l)["eer"], r1
+    s, l, accs = cross_fw_eval(f, y, fw, k, method, z, rng, FOOTWEAR)
+    return (report_from_scores(s, l)["eer"], *accs)         # (eer, rank1, rank3, rank5)
 
 
 def enroll_curve(f, y, fw, ks, method, z, FOOTWEAR, repeats=3):
-    """(k, EER, rank1-accuracy) vs enrolled footsteps, averaged over `repeats` support draws."""
+    """(k, EER, rank1, rank3, rank5) vs enrolled footsteps, averaged over `repeats` support draws."""
     out = []
     for k in ks:
         m = [metrics_at(f, y, fw, k, method, z, np.random.default_rng(r), FOOTWEAR) for r in range(repeats)]
-        out.append((k, float(np.mean([a[0] for a in m])), float(np.mean([a[1] for a in m]))))
+        m = np.array(m)                                     # (repeats, 4) -> mean each column
+        out.append((k, *[float(v) for v in m.mean(0)]))     # (k, eer, rank1, rank3, rank5)
     return out
 
 
@@ -110,13 +132,18 @@ def plot_all(curves, f, y, fw, ks, z, FOOTWEAR, out_dir):
     import matplotlib.pyplot as plt
     out_dir = pathlib.Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) HEADLINE: rank-1 identification ACCURACY vs #enrolled footsteps (BD-CSPN's metric)
-    fig, a = plt.subplots(figsize=(6, 4.3))
-    for name, pts in curves.items():
-        a.plot([p[0] for p in pts], [p[2] * 100 for p in pts], marker="o", ms=4, label=name)
-    a.set_xlabel("# enrolled footsteps (k)"); a.set_ylabel("rank-1 identification accuracy (%)")
+    # 1) HEADLINE: rank-1/3/5 identification ACCURACY vs #enrolled footsteps (BD-CSPN's metric).
+    # One colour per method; rank-1 solid, rank-3 dashed, rank-5 dotted (p[2]/p[3]/p[4]).
+    fig, a = plt.subplots(figsize=(6.4, 4.3))
+    styles = [("rank1", 2, "-", "o"), ("rank3", 3, "--", "s"), ("rank5", 4, ":", "^")]
+    for ci, (name, pts) in enumerate(curves.items()):
+        col = f"C{ci}"
+        for lbl, idx, ls, mk in styles:
+            a.plot([p[0] for p in pts], [p[idx] * 100 for p in pts], ls=ls, marker=mk, ms=4,
+                   color=col, label=f"{name} {lbl}")
+    a.set_xlabel("# enrolled footsteps (k)"); a.set_ylabel("rank-1/3/5 identification accuracy (%)")
     a.set_title("Enrollment: more footsteps -> better recognition")
-    a.legend(fontsize=8); a.grid(alpha=.3)
+    a.legend(fontsize=6, ncol=len(curves)); a.grid(alpha=.3)
     fig.tight_layout(); fig.savefig(out_dir / "enroll_acc_vs_k.png", dpi=120); plt.close(fig)
 
     # 2) EER vs #enrolled footsteps (verification / competition metric) + 1/sqrt(K) variance trend
@@ -175,8 +202,10 @@ def run(f, y, fw, ks, z, out_dir, FOOTWEAR, adabn_feats=None):
     import pandas as pd
     curves = {}
 
-    def _show(m, pts):                                # print rank-1 acc (headline) + EER
-        print(f"  {m:12s}  " + "  ".join(f"k{k}:acc{r*100:.1f}/eer{e*100:.1f}" for k, e, r in pts), flush=True)
+    def _show(m, pts):                                # print rank-1/3/5 acc (headline) + EER
+        print(f"  {m:12s}  " + "  ".join(
+            f"k{k}:r1{r1*100:.1f}/r3{r3*100:.1f}/r5{r5*100:.1f}/eer{e*100:.1f}"
+            for k, e, r1, r3, r5 in pts), flush=True)
 
     for method in ("ncm", "cl2n", "bdcspn"):
         curves[method] = enroll_curve(f, y, fw, ks, method, z, FOOTWEAR); _show(method, curves[method])
@@ -185,7 +214,8 @@ def run(f, y, fw, ks, z, out_dir, FOOTWEAR, adabn_feats=None):
         curves["bdcspn+adabn"] = enroll_curve(fa, ya, fwa, ks, "bdcspn", z, FOOTWEAR)
         _show("bdcspn+adabn", curves["bdcspn+adabn"])
     plot_all(curves, f, y, fw, ks, z, FOOTWEAR, out_dir)
-    rows = [dict(method=m, k=k, eer=e, rank1=r) for m, pts in curves.items() for k, e, r in pts]
+    rows = [dict(method=m, k=k, eer=e, rank1=r1, rank3=r3, rank5=r5)
+            for m, pts in curves.items() for k, e, r1, r3, r5 in pts]
     pd.DataFrame(rows).to_parquet(pathlib.Path(out_dir) / "enroll_results.parquet", index=False)
     return curves
 
@@ -233,13 +263,17 @@ def main():
         import wandb
         wr = wandb.init(project=args.wandb_project, mode=args.wandb,
                         name=f"enroll_{args.model}" + (f"_{args.tag}" if args.tag else ""))
-        tbl = wandb.Table(columns=["method", "k", "eer", "rank1"],
-                          data=[[m, k, e, r] for m, pts in curves.items() for k, e, r in pts])
+        tbl = wandb.Table(columns=["method", "k", "eer", "rank1", "rank3", "rank5"],
+                          data=[[m, k, e, r1, r3, r5]
+                                for m, pts in curves.items() for k, e, r1, r3, r5 in pts])
         wr.log({"enroll/results": tbl})
         for p in sorted(pathlib.Path(args.out).glob("enroll_*.png")):
             wr.log({f"enroll/{p.stem}": wandb.Image(str(p))})
         for m, pts in curves.items():                  # best (largest-k) metrics per method -> summary
-            wr.summary[f"{m}_eer_bestk"] = pts[-1][1]; wr.summary[f"{m}_rank1_bestk"] = pts[-1][2]
+            wr.summary[f"{m}_eer_bestk"] = pts[-1][1]
+            wr.summary[f"{m}_rank1_bestk"] = pts[-1][2]
+            wr.summary[f"{m}_rank3_bestk"] = pts[-1][3]
+            wr.summary[f"{m}_rank5_bestk"] = pts[-1][4]
         wr.finish()
         print("  logged curves + plots to wandb", flush=True)
 

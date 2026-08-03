@@ -50,6 +50,11 @@ def train(model_fn, man_tr, cfg, tag, max_epochs=40, patience=8, steps_per_epoch
     n_ids = man_tr.ParticipantID.nunique()
     P = min(P, n_ids)                                         # can't sample more ids than exist
     net = model_fn(embed_dim=cfg["embed_dim"], n_classes=None, **(model_kw or {})).to(dev)
+    if cfg.get("init_from"):                             # optional SSL-pretrained backbone init
+        _sd = torch.load(cfg["init_from"], map_location=dev); _sd = _sd.get("state", _sd)
+        _miss, _unexp = net.backbone.load_state_dict(_sd, strict=False)
+        print(f"[init-from] {cfg['init_from']}: backbone init "
+              f"({len(_sd) - len(_unexp)}/{len(_sd)} keys, missing={len(_miss)}, unexpected={len(_unexp)})")
     ema = ModelEMA(net)                                  # YOLO-style weight EMA; val runs on this
     crit = Criterion(cfg, n_ids, cfg["embed_dim"]).to(dev)
     # optional RL-learned GEOMETRIC augmentation policy (Adversarial-AutoAugment; winners used
