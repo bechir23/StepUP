@@ -23,7 +23,7 @@ from pytorch_metric_learning import losses
 from stepup.config import ARTIFACTS, T, dev
 from stepup.data import build_datasets
 from stepup.eval import embed_dataset
-from stepup.models import registry, set_dropout
+from stepup.models import registry, set_adaptive_proj, set_dropout
 from aggregate import WalkAggregator, walk_windows, walk_metrics
 
 
@@ -36,14 +36,18 @@ def load_backbone_trainable(model, hf_repo, hf_token, tag="", in_frames=0, scrat
         from stepup.hf import fetch_file
         ckpt = fetch_file(hf_repo, fname, hf_token)
     ck = torch.load(ckpt, map_location=dev, weights_only=False)
-    cfg = ck["cfg"]; set_dropout(cfg.get("dropout", 0.0))
+    cfg = ck["cfg"]; set_dropout(cfg.get("dropout", 0.0)); set_adaptive_proj(cfg.get("adaptive_proj", False))
     data_t = (cfg.get("sample3d") or cfg.get("pack_res") or (T, T, T))[0]
     if cfg.get("stride_pairs"):
         data_t *= 2
     if in_frames > 0:
         data_t = in_frames
     spec = registry(cfg["sample3d"], data_t)[model]
-    net = spec["fn"](embed_dim=cfg["embed_dim"], n_classes=None, **spec["kw"]).to(dev)
+    # Rebuild with the architecture toggles the checkpoint was trained with (hpp changes feat_dim),
+    # overlaid on the registry base kwargs; old checkpoints without a saved kw fall back cleanly.
+    _saved_kw = ck.get("kw", {}) or {}
+    _kw = {**spec["kw"], **{k: _saved_kw[k] for k in ("hpp", "dsu", "mixstyle") if k in _saved_kw}}
+    net = spec["fn"](embed_dim=cfg["embed_dim"], n_classes=None, **_kw).to(dev)
     if not scratch:
         net.load_state_dict(ck["state"])          # scratch=True -> keep the fresh random init
     return net, cfg

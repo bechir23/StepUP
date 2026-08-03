@@ -25,7 +25,7 @@ from stepup.eval import (accumulated_identification, condition_verification,
                          cross_footwear_scores, cross_footwear_verification, embed_dataset,
                          embedding_panel, leave_one_footwear_out, open_set_accumulated,
                          plot_det, plot_embeddings, plot_history, summarise)
-from stepup.models import registry, set_dropout
+from stepup.models import registry, set_adaptive_proj, set_dropout
 from stepup.wb import init_run
 
 
@@ -39,6 +39,7 @@ def main():
 
     cfg = build_cfg(args)
     set_dropout(cfg["dropout"])
+    set_adaptive_proj(cfg.get("adaptive_proj", False))
     seed_everything()
     data_t = (cfg["sample3d"] or cfg["pack_res"] or (T, H, W))[0]   # what the model actually sees
     if cfg.get("stride_pairs"):
@@ -74,7 +75,7 @@ def main():
                                 ds_tr_mon=ds.get("train_mon"), mining=cfg["mining"],
                                 wandb_run=run, rl_augment=getattr(args, "rl_augment", False),
                                 rl_M=getattr(args, "rl_copies", 4))
-        torch.save(dict(state=best["state"], cfg=cfg, model=name, kw=spec["kw"],
+        torch.save(dict(state=best["state"], cfg=cfg, model=name, kw=mkw,
                         val_fitness=best["val"], epoch=best["epoch"]),
                    ARTIFACTS / f"{aname}_best.pt")
         hist.to_parquet(ARTIFACTS / f"hist_{aname}.parquet", index=False)

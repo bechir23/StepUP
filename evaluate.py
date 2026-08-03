@@ -16,7 +16,7 @@ from stepup.config import ARTIFACTS, DEF_KS, T, dev, seed_everything
 from stepup.data import build_datasets
 from stepup.eval import (accumulated_identification, cross_footwear_verification,
                          leave_one_footwear_out, open_set_accumulated, plot_embeddings, summarise)
-from stepup.models import registry, set_dropout
+from stepup.models import registry, set_adaptive_proj, set_dropout
 
 
 def main():
@@ -44,10 +44,16 @@ def main():
     ck = torch.load(ckpt, map_location=dev, weights_only=False)
     cfg = ck["cfg"]
     set_dropout(cfg.get("dropout", 0.0))
+    set_adaptive_proj(cfg.get("adaptive_proj", False))
     data_t = cfg["pack_res"][0] if cfg["pack_res"] else T
     reg = registry(cfg["sample3d"], data_t)
     spec = reg[args.model]
-    net = spec["fn"](embed_dim=cfg["embed_dim"], n_classes=None, **spec["kw"]).to(dev)
+    # Overlay the architecture toggles the model was TRAINED with (hpp/dsu/mixstyle) onto the
+    # registry's base kwargs -- hpp changes feat_dim (256->1792), so rebuilding without it fails the
+    # strict load. in_frames stays from spec["kw"] (current data). Old ckpts (no saved kw) fall back.
+    _saved_kw = ck.get("kw", {}) or {}
+    _kw = {**spec["kw"], **{k: _saved_kw[k] for k in ("hpp", "dsu", "mixstyle") if k in _saved_kw}}
+    net = spec["fn"](embed_dim=cfg["embed_dim"], n_classes=None, **_kw).to(dev)
     net.load_state_dict(ck["state"]); net.eval()
 
     _, ds = build_datasets(cfg)

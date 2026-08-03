@@ -16,11 +16,20 @@ from torchvision.models import resnet18
 from .config import T, H, W
 
 _DROPOUT = 0.0
+_ADAPTIVE_PROJ = False
 
 
 def set_dropout(p):
     global _DROPOUT
     _DROPOUT = p
+
+
+def set_adaptive_proj(flag):
+    """Enable/disable the optional 2-stage embedding projection (read at Embedder construction,
+    exactly like set_dropout). OFF by default so existing checkpoints keep identical state_dict keys.
+    train/eval set it from cfg['adaptive_proj'], so a model is always rebuilt the way it was trained."""
+    global _ADAPTIVE_PROJ
+    _ADAPTIVE_PROJ = flag
 
 
 class MixStyle(nn.Module):
@@ -150,14 +159,26 @@ class Embedder(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.drop = nn.Dropout(_DROPOUT)
-        self.embed = nn.Linear(feat_dim, embed_dim)
+        # Optional adaptive projection: only when explicitly enabled AND the drop is abrupt
+        # (feat_dim/embed_dim > 8, e.g. hpp's 1792->128 or convnext's 768->64). Inserts one
+        # Linear(feat_dim->mid)+BN+ReLU with mid=feat_dim//4 so the embedding isn't over-compressed
+        # in a single step. Default OFF -> proj is Identity, no params, state_dict keys unchanged.
+        use_ap = _ADAPTIVE_PROJ and feat_dim > 8 * embed_dim
+        if use_ap:
+            mid = max(embed_dim, feat_dim // 4)
+            self.proj = nn.Sequential(nn.Linear(feat_dim, mid), nn.BatchNorm1d(mid), nn.ReLU(inplace=True))
+            embed_in = mid
+        else:
+            self.proj = nn.Identity()
+            embed_in = feat_dim
+        self.embed = nn.Linear(embed_in, embed_dim)
         self.bnneck = nn.BatchNorm1d(embed_dim)
         self.bnneck.bias.requires_grad_(False)
         self.classifier = nn.Linear(embed_dim, n_classes, bias=False) if n_classes else None
 
     def forward(self, x):
         h = self.drop(self.backbone(x))
-        f_t = self.embed(h)
+        f_t = self.embed(self.proj(h))
         f_i = self.bnneck(f_t)
         logits = self.classifier(f_i) if self.classifier is not None else None
         return f_t, f_i, logits
@@ -377,6 +398,50 @@ def make_convnext(embed_dim=128, n_classes=None, in_frames=T):
     return Embedder(backbone, feat_dim=768, embed_dim=embed_dim, n_classes=n_classes)
 
 
+def _adapt_first_conv(conv, in_frames):
+    """Replace a torchvision stem Conv2d's 3-channel input with `in_frames` (frames-as-channels,
+    exactly like make_resnet2d), keeping its out_channels / kernel / stride / padding intact so the
+    rest of the pretrained-shape backbone is untouched. weights=None here so no pretrain is lost."""
+    return nn.Conv2d(in_frames, conv.out_channels, conv.kernel_size, conv.stride,
+                     conv.padding, bias=conv.bias is not None)
+
+
+def make_mobilenet_v3_small(embed_dim=128, n_classes=None, in_frames=T):
+    """MobileNetV3-Small (torchvision, weights=None): inverted-residual + squeeze-excite mobile CNN,
+    ~1.5M params, one of the fastest real-time 2D backbones. First conv adapted to in_frames; the
+    classifier is dropped so features->avgpool->flatten yields a 576-d pooled vector for Embedder."""
+    from torchvision.models import mobilenet_v3_small
+    net = mobilenet_v3_small(weights=None)
+    net.features[0][0] = _adapt_first_conv(net.features[0][0], in_frames)   # Conv2d(3,16,3,s2)
+    net.classifier = nn.Identity()                   # forward = features->avgpool->flatten->Identity
+    return Embedder(nn.Sequential(TimeAsChannels(), net), feat_dim=576,
+                    embed_dim=embed_dim, n_classes=n_classes)
+
+
+def make_shufflenet_v2_x1_0(embed_dim=128, n_classes=None, in_frames=T):
+    """ShuffleNetV2 x1.0 (torchvision, weights=None): channel-shuffle mobile CNN, ~1.3M params,
+    designed for real-time inference. First conv adapted to in_frames; fc dropped so the backbone's
+    own global-mean-pool yields a 1024-d pooled vector for Embedder."""
+    from torchvision.models import shufflenet_v2_x1_0
+    net = shufflenet_v2_x1_0(weights=None)
+    net.conv1[0] = _adapt_first_conv(net.conv1[0], in_frames)               # Conv2d(3,24,3,s2)
+    net.fc = nn.Identity()                           # forward already mean-pools before fc -> 1024
+    return Embedder(nn.Sequential(TimeAsChannels(), net), feat_dim=1024,
+                    embed_dim=embed_dim, n_classes=n_classes)
+
+
+def make_efficientnet_b0(embed_dim=128, n_classes=None, in_frames=T):
+    """EfficientNet-B0 (torchvision, weights=None): MBConv + squeeze-excite, ~4M params, a strong
+    real-time accuracy/latency trade-off. First conv adapted to in_frames; classifier dropped so
+    features->avgpool->flatten yields a 1280-d pooled vector for Embedder."""
+    from torchvision.models import efficientnet_b0
+    net = efficientnet_b0(weights=None)
+    net.features[0][0] = _adapt_first_conv(net.features[0][0], in_frames)   # Conv2d(3,32,3,s2)
+    net.classifier = nn.Identity()                   # forward = features->avgpool->flatten->Identity
+    return Embedder(nn.Sequential(TimeAsChannels(), net), feat_dim=1280,
+                    embed_dim=embed_dim, n_classes=n_classes)
+
+
 class ResBlock2d(nn.Module):
     """Standard 3x3 residual block; the skip keeps gradients healthy as depth grows."""
 
@@ -594,6 +659,12 @@ def registry(sample3d, data_t=T):
                          smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "resnet2d_light": dict(fn=make_resnet2d_light, kw=dict(in_frames=data_t), full_pk=pk2d,
                               smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "mobilenet_v3_small": dict(fn=make_mobilenet_v3_small, kw=dict(in_frames=data_t), full_pk=pk2d,
+                                   smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "shufflenet_v2_x1_0": dict(fn=make_shufflenet_v2_x1_0, kw=dict(in_frames=data_t), full_pk=pk2d,
+                                   smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
+        "efficientnet_b0": dict(fn=make_efficientnet_b0, kw=dict(in_frames=data_t), full_pk=pk2d,
+                                smoke_pk=(2, 4), smoke_kw=dict(in_frames=data_t)),
         "cnnlstm":  dict(fn=make_cnnlstm, kw=dict(n_frames=min(32, data_t)), full_pk=pk2d,
                          smoke_pk=(2, 4), smoke_kw=dict(n_frames=min(16, data_t))),
         "r2plus1d": dict(fn=make_r2plus1d, kw=dict(resize=clip3d), full_pk=pk3d,
@@ -624,8 +695,10 @@ def registry(sample3d, data_t=T):
     # 1.5e-4..8e-4 band regardless of its batch.
     for n, spec in reg.items():
         spec["lr_mult"] = 1.0
-    for n in ("gaitcnn", "gaitcnn_in", "gaitcnn_snr", "resnet2d_snr", "gaitcnn_deep", "gaitcnn_tiny", "resnet2d", "resnet2d_light", "cnnlstm"):
-        reg[n]["lr_mult"] = 0.4                           # 2D CNNs: 2e-3 -> ~8e-4 at batch 512
+    for n in ("gaitcnn", "gaitcnn_in", "gaitcnn_snr", "resnet2d_snr", "gaitcnn_deep", "gaitcnn_tiny",
+              "resnet2d", "resnet2d_light", "cnnlstm",
+              "mobilenet_v3_small", "shufflenet_v2_x1_0", "efficientnet_b0"):
+        reg[n]["lr_mult"] = 0.4                           # light 2D CNNs: 2e-3 -> ~8e-4 at batch 512
     for n in ("r2plus1d", "r2plus1d_snr", "r2plus1d_light", "r3d", "r3d_light", "gaitcnn_r21d"):
         reg[n]["lr_mult"] = 0.35                          # video ResNets + (2+1)D: peak ~5e-4 at batch 256
     for n in ("swin3d", "swin3d_light", "vit"):

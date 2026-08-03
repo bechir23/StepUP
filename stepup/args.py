@@ -28,6 +28,11 @@ def add_common_args(ap):
                    help="Stochastic Weight Averaging: average post-warmup weights and eval that "
                         "flat-minimum model (swa_* metrics) -- holds the peak, kills the decay")
     g.add_argument("--embed-dim", type=int, default=128)
+    g.add_argument("--adaptive-proj", action="store_true", default=False,
+                   help="insert a 2-stage embedding projection (Linear->BN->ReLU->Linear, mid=feat//4) "
+                        "only when feat_dim/embed_dim > 8 (e.g. hpp 1792->128, convnext 768->64), so a "
+                        "wide backbone isn't over-shrunk in one Linear. Off by default; changes the "
+                        "state_dict -> train from scratch. Stored in cfg so eval rebuilds it correctly.")
     g.add_argument("--workers", type=int, default=8, help="DataLoader workers (Colab has cores)")
     g.add_argument("--log-every", type=int, default=0,
                    help="log train loss every N steps; 0 = auto (~20 logs/epoch, so the curve has "
@@ -114,6 +119,9 @@ def add_common_args(ap):
                    help="keep only the first N identities per split (0 = all)")
     s.add_argument("--smoke", action="store_true",
                    help="tiny local run: few ids, stream (no pack), few epochs, small input")
+    s.add_argument("--init-from", default="",
+                   help="checkpoint to initialise the backbone from (e.g. an SSL-pretrained "
+                        "ssl_gaitcnn_snr_simclr.pt); empty keeps random init")
     return ap
 
 
