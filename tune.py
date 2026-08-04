@@ -9,9 +9,9 @@ GRM search, without a custom regressor). Optuna's study plots (optimization hist
 importance, slice, parallel-coordinate, intermediate-values) are written to artifacts/ and, if wandb
 is on, logged to one run.
 
-Search space = weight_decay, arc_scale, dropout, label_smooth, K in 4..8, and the mixstyle/dsu/hpp
-architecture toggles. FIXED (not searched): lr=1e-4, embed_dim=256, P=256 (the engine clamps P to the
-number of training identities).
+Search space = weight_decay, arc_scale, dropout, label_smooth, K in 4..8, embed_dim in {64,128,256},
+and the mixstyle/dsu/hpp architecture toggles. FIXED (not searched): lr=1e-4, P=256 (the engine
+clamps P to the number of training identities).
 (margin_warmup_frac and channel widths are NOT searched yet -- the engine hardcodes the margin ramp
 and the gaitcnn_snr factory hardcodes widths; both need a 1-line change before they're searchable.)
 
@@ -29,7 +29,7 @@ from stepup.args import add_common_args, apply_smoke
 from stepup.config import ARTIFACTS, H, T, W, build_cfg, seed_everything
 from stepup.data import build_datasets
 from stepup.engine import train
-from stepup.models import registry, set_dropout
+from stepup.models import registry, set_dropout, set_adaptive_proj
 
 
 
@@ -42,7 +42,7 @@ def build_objective(ds, man, args):
         a.weight_decay = trial.suggest_float("weight_decay", 1e-4, 5e-2, log=True)   # HIGH (reg)
         a.arc_scale = trial.suggest_categorical("arc_scale", [8, 16, 24, 32, 48, 64])  # HIGH
         a.dropout = trial.suggest_float("dropout", 0.0, 0.5)
-        a.embed_dim = 256                                    # FIXED (not searched)
+        a.embed_dim = trial.suggest_categorical("embed_dim", [64, 128, 256])   # searched
         a.label_smooth = trial.suggest_float("label_smooth", 0.0, 0.25)
         P = 256                                              # FIXED (engine clamps to #train IDs)
         K = trial.suggest_int("K", 4, 8)                     # steps per identity, 4..8
@@ -51,6 +51,7 @@ def build_objective(ds, man, args):
                        hpp=trial.suggest_categorical("hpp", [True, False]))   # the discrete arch search
         cfg = build_cfg(a)
         set_dropout(cfg["dropout"])
+        set_adaptive_proj(cfg.get("adaptive_proj", False))   # honour --adaptive-proj (hpp at low embed)
         seed_everything()
         data_t = (cfg["sample3d"] or cfg["pack_res"] or (T, H, W))[0]
         if cfg.get("stride_pairs"):
@@ -170,7 +171,7 @@ def main():
             flags.append(f"--{k.replace('_', '-')} {v}")
     # include the FIXED values explicitly, else train.py falls back to its own defaults (lr=1e-3,
     # embed_dim=128) and silently retrains a different model than the search found.
-    cmd = (f"python train.py --model {args.model} --lr 1e-4 --embed-dim 256 --P 256 "
+    cmd = (f"python train.py --model {args.model} --lr 1e-4 --P 256 "
            + " ".join(f for f in flags if f))
     print(f"  retrain the winner at full epochs:\n    {cmd}")
     save_plots(study, run)
