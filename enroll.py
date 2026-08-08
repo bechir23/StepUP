@@ -111,16 +111,17 @@ def cross_fw_scores(f, y, fw, k, method="ncm", z=8, rng=None, FOOTWEAR=None):
 def metrics_at(f, y, fw, k, method, z, rng, FOOTWEAR):
     from stepup.metrics import report_from_scores
     s, l, accs = cross_fw_eval(f, y, fw, k, method, z, rng, FOOTWEAR)
-    return (report_from_scores(s, l)["eer"], *accs)         # (eer, rank1, rank3, rank5)
+    r = report_from_scores(s, l)
+    return (r["eer"], r["fmr100"], r["fnmr"], *accs)        # (eer, fmr100, fnmr, rank1, rank3, rank5)
 
 
 def enroll_curve(f, y, fw, ks, method, z, FOOTWEAR, repeats=3):
-    """(k, EER, rank1, rank3, rank5) vs enrolled footsteps, averaged over `repeats` support draws."""
+    """(k, EER, FMR100, FNMR, rank1, rank3, rank5) vs enrolled footsteps, averaged over `repeats` draws."""
     out = []
     for k in ks:
         m = [metrics_at(f, y, fw, k, method, z, np.random.default_rng(r), FOOTWEAR) for r in range(repeats)]
-        m = np.array(m)                                     # (repeats, 4) -> mean each column
-        out.append((k, *[float(v) for v in m.mean(0)]))     # (k, eer, rank1, rank3, rank5)
+        m = np.array(m)                                     # (repeats, 6) -> mean each column
+        out.append((k, *[float(v) for v in m.mean(0)]))     # (k, eer, fmr100, fnmr, rank1, rank3, rank5)
     return out
 
 
@@ -133,9 +134,9 @@ def plot_all(curves, f, y, fw, ks, z, FOOTWEAR, out_dir):
     out_dir = pathlib.Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) HEADLINE: rank-1/3/5 identification ACCURACY vs #enrolled footsteps (BD-CSPN's metric).
-    # One colour per method; rank-1 solid, rank-3 dashed, rank-5 dotted (p[2]/p[3]/p[4]).
+    # One colour per method; rank-1 solid, rank-3 dashed, rank-5 dotted (p[4]/p[5]/p[6]).
     fig, a = plt.subplots(figsize=(6.4, 4.3))
-    styles = [("rank1", 2, "-", "o"), ("rank3", 3, "--", "s"), ("rank5", 4, ":", "^")]
+    styles = [("rank1", 4, "-", "o"), ("rank3", 5, "--", "s"), ("rank5", 6, ":", "^")]
     for ci, (name, pts) in enumerate(curves.items()):
         col = f"C{ci}"
         for lbl, idx, ls, mk in styles:
@@ -202,10 +203,10 @@ def run(f, y, fw, ks, z, out_dir, FOOTWEAR, adabn_feats=None):
     import pandas as pd
     curves = {}
 
-    def _show(m, pts):                                # print rank-1/3/5 acc (headline) + EER
+    def _show(m, pts):                                # print rank-1/3/5 acc (headline) + EER/FMR100
         print(f"  {m:12s}  " + "  ".join(
-            f"k{k}:r1{r1*100:.1f}/r3{r3*100:.1f}/r5{r5*100:.1f}/eer{e*100:.1f}"
-            for k, e, r1, r3, r5 in pts), flush=True)
+            f"k{k}:r1{r1*100:.1f}/r3{r3*100:.1f}/r5{r5*100:.1f}/eer{e*100:.1f}/fmr100{fmr*100:.1f}"
+            for k, e, fmr, fnmr, r1, r3, r5 in pts), flush=True)
 
     for method in ("ncm", "cl2n", "bdcspn"):
         curves[method] = enroll_curve(f, y, fw, ks, method, z, FOOTWEAR); _show(method, curves[method])
@@ -214,8 +215,8 @@ def run(f, y, fw, ks, z, out_dir, FOOTWEAR, adabn_feats=None):
         curves["bdcspn+adabn"] = enroll_curve(fa, ya, fwa, ks, "bdcspn", z, FOOTWEAR)
         _show("bdcspn+adabn", curves["bdcspn+adabn"])
     plot_all(curves, f, y, fw, ks, z, FOOTWEAR, out_dir)
-    rows = [dict(method=m, k=k, eer=e, rank1=r1, rank3=r3, rank5=r5)
-            for m, pts in curves.items() for k, e, r1, r3, r5 in pts]
+    rows = [dict(method=m, k=k, eer=e, fmr100=fmr, fnmr=fnmr, rank1=r1, rank3=r3, rank5=r5)
+            for m, pts in curves.items() for k, e, fmr, fnmr, r1, r3, r5 in pts]
     pd.DataFrame(rows).to_parquet(pathlib.Path(out_dir) / "enroll_results.parquet", index=False)
     return curves
 
@@ -263,17 +264,18 @@ def main():
         import wandb
         wr = wandb.init(project=args.wandb_project, mode=args.wandb,
                         name=f"enroll_{args.model}" + (f"_{args.tag}" if args.tag else ""))
-        tbl = wandb.Table(columns=["method", "k", "eer", "rank1", "rank3", "rank5"],
-                          data=[[m, k, e, r1, r3, r5]
-                                for m, pts in curves.items() for k, e, r1, r3, r5 in pts])
+        tbl = wandb.Table(columns=["method", "k", "eer", "fmr100", "fnmr", "rank1", "rank3", "rank5"],
+                          data=[[m, k, e, fmr, fnmr, r1, r3, r5]
+                                for m, pts in curves.items() for k, e, fmr, fnmr, r1, r3, r5 in pts])
         wr.log({"enroll/results": tbl})
         for p in sorted(pathlib.Path(args.out).glob("enroll_*.png")):
             wr.log({f"enroll/{p.stem}": wandb.Image(str(p))})
         for m, pts in curves.items():                  # best (largest-k) metrics per method -> summary
             wr.summary[f"{m}_eer_bestk"] = pts[-1][1]
-            wr.summary[f"{m}_rank1_bestk"] = pts[-1][2]
-            wr.summary[f"{m}_rank3_bestk"] = pts[-1][3]
-            wr.summary[f"{m}_rank5_bestk"] = pts[-1][4]
+            wr.summary[f"{m}_fmr100_bestk"] = pts[-1][2]
+            wr.summary[f"{m}_rank1_bestk"] = pts[-1][4]
+            wr.summary[f"{m}_rank3_bestk"] = pts[-1][5]
+            wr.summary[f"{m}_rank5_bestk"] = pts[-1][6]
         wr.finish()
         print("  logged curves + plots to wandb", flush=True)
 
