@@ -57,10 +57,21 @@ def adabn_recalibrate(net, batches, dev):
 # ----------------------------- ONNX export + quantize -----------------------------
 def export_fp32(wrap, dummy, path):
     wrap.eval()
-    torch.onnx.export(wrap, dummy, path, input_names=["x"], output_names=["emb"],
-                      dynamic_axes={"x": {0: "B"}, "emb": {0: "B"}}, opset_version=17)
+    # legacy TorchScript exporter: embeds weights in ONE .onnx file and writes clean
+    # dynamic-batch shapes. (The dynamo exporter stored weights externally -> a stub graph
+    # with inconsistent shape annotations that ONNX strict shape-inference rejects at quant time.)
+    torch.onnx.export(
+        wrap,
+        dummy,
+        path,
+        input_names=["x"],
+        output_names=["emb"],
+        dynamic_axes={"x": {0: "B"}, "emb": {0: "B"}},
+        opset_version=17,
+        do_constant_folding=True,
+        dynamo=False,          # force the legacy TorchScript exporter (single-file weights)
+    )
     return path
-
 
 def to_fp16(fp32_path, out_path):
     from onnxconverter_common import float16

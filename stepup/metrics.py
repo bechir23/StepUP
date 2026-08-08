@@ -2,6 +2,7 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import auc as _auc
 from sklearn.metrics import roc_curve
 
 
@@ -66,7 +67,9 @@ def report_from_scores(scores, labels):
     # interpolation (roc_curve gives fpr non-decreasing). The old code read FMR at FNMR=1% -- the
     # INVERSE -- which is why our FMR100 never matched the leaderboard (winner 59.63%, not ~5-40%).
     fmr100 = float(np.interp(0.01, fpr, fnr))
-    return dict(eer=float((fpr[i] + fnr[i]) / 2), fmr100=fmr100,
+    # ROC-AUC straight off the same curve (fpr non-decreasing) -- the whole-curve companion to EER.
+    auc = float(_auc(fpr, tpr))
+    return dict(eer=float((fpr[i] + fnr[i]) / 2), fmr100=fmr100, auc=auc,
                 accuracy=(tp + tn) / max(1, len(labels)),
                 balanced_accuracy=1 - (fmr + fnmr) / 2, precision=prec, recall=rec,
                 f1=2 * prec * rec / max(1e-9, prec + rec), fmr=fmr, fnmr=fnmr)

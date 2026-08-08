@@ -37,7 +37,9 @@ def main():
     if not os.path.exists(ckpt):                 # checkpoint offloaded to HF? fetch it
         if args.hf_repo:
             from stepup.hf import fetch_file
-            ckpt = fetch_file(args.hf_repo, f"{args.model}_best.pt", args.hf_token)
+            # fetch the exact file the user asked for (tagged checkpoints are {model}_{tag}_best.pt,
+            # not just {model}_best.pt), falling back to the plain name only when --ckpt was default.
+            ckpt = fetch_file(args.hf_repo, os.path.basename(ckpt), args.hf_token)
             print(f"fetched checkpoint from HF: {ckpt}")
         else:
             raise SystemExit(f"checkpoint not found: {ckpt}\nPass --hf-repo user/name to fetch it from HF.")
@@ -66,9 +68,27 @@ def main():
     print(f"\nsummary  same_rank1 {s.get('same_rank1', float('nan')):.3f}  "
           f"cross_rank1 {s.get('cross_rank1', float('nan')):.3f}  "
           f"cross_eer {s.get('cross_eer', float('nan')):.3f}")
-    print(f"verification  EER {vr['eer']:.3f}  BACC {vr['balanced_accuracy']:.3f}  "
-          f"F1 {vr['f1']:.3f}  precision {vr['precision']:.3f}  recall {vr['recall']:.3f}  "
-          f"FMR {vr['fmr']:.3f}  FNMR {vr['fnmr']:.3f}")
+    print(f"verification  EER {vr['eer']:.3f}  FMR100 {vr['fmr100']:.3f}  AUC {vr['auc']:.3f}  "
+          f"BACC {vr['balanced_accuracy']:.3f}  F1 {vr['f1']:.3f}  precision {vr['precision']:.3f}  "
+          f"recall {vr['recall']:.3f}  FMR {vr['fmr']:.3f}  FNMR {vr['fnmr']:.3f}")
+    # Competition-style metrics at a FIXED decision threshold calibrated on validation (the analog of
+    # each team's "submitted threshold"). Away from the equal-error point, FMR, FNMR, ACC and BACC no
+    # longer coincide with the EER -- these are the distinct values to tabulate alongside the teams.
+    if "val" in ds and args.split == "test":
+        import numpy as np
+        from sklearn.metrics import roc_curve
+        from stepup.eval import cross_footwear_scores
+        vs, vl = cross_footwear_scores(net, ds["val"])
+        vfpr, vtpr, vthr = roc_curve(np.asarray(vl).astype(int), np.asarray(vs))
+        tau_fix = float(vthr[np.nanargmin(np.abs((1 - vtpr) - vfpr))])   # val equal-error threshold
+        ts, tl = cross_footwear_scores(net, target)
+        tl = np.asarray(tl).astype(int); pred = (np.asarray(ts) >= tau_fix).astype(int)
+        tp = int(((pred == 1) & (tl == 1)).sum()); fp = int(((pred == 1) & (tl == 0)).sum())
+        tn = int(((pred == 0) & (tl == 0)).sum()); fn = int(((pred == 0) & (tl == 1)).sum())
+        fmr_f = fp / max(1, fp + tn); fnmr_f = fn / max(1, fn + tp)
+        acc_f = (tp + tn) / max(1, len(tl)); bacc_f = 1 - (fmr_f + fnmr_f) / 2
+        print(f"at val-calibrated threshold  ACC {acc_f*100:.2f}  BACC {bacc_f*100:.2f}  "
+              f"FNMR {fnmr_f*100:.2f}  FMR {fmr_f*100:.2f}")
     ks = tuple(int(v) for v in args.ks.split(","))
     acc = accumulated_identification(net, target, ks=ks)
     print("accumulated rank1 (cross-footwear, hard)      " +
