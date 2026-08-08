@@ -47,7 +47,9 @@ def main():
     cfg = ck["cfg"]
     set_dropout(cfg.get("dropout", 0.0))
     set_adaptive_proj(cfg.get("adaptive_proj", False))
-    data_t = cfg["pack_res"][0] if cfg["pack_res"] else T
+    data_t = (cfg.get("sample3d") or cfg.get("pack_res") or (T, T, T))[0]   # what the model sees
+    if cfg.get("stride_pairs"):
+        data_t *= 2                          # a stride = left+right concatenated in time (frames->channels)
     reg = registry(cfg["sample3d"], data_t)
     spec = reg[args.model]
     # Overlay the architecture toggles the model was TRAINED with (hpp/dsu/mixstyle) onto the
