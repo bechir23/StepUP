@@ -14,8 +14,9 @@ import torch
 
 from stepup.config import ARTIFACTS, DEF_KS, T, dev, seed_everything
 from stepup.data import build_datasets
-from stepup.eval import (accumulated_identification, cross_footwear_verification,
-                         leave_one_footwear_out, open_set_accumulated, plot_embeddings, summarise)
+from stepup.eval import (accumulated_identification, accumulated_identification_bdcspn,
+                         cross_footwear_verification, leave_one_footwear_out,
+                         open_set_accumulated, plot_embeddings, summarise)
 from stepup.models import registry, set_adaptive_proj, set_dropout
 
 
@@ -98,6 +99,11 @@ def main():
     osa = open_set_accumulated(net, target, ks=ks)
     print("accumulated rank1 (mixed gallery, ref ~0.9)   " +
           "  ".join(f"{k}-step {v:.3f}" for k, v in osa.items()))
+    # Live-monitoring variant: the full reference-footwear gallery, rectified by BD-CSPN with the
+    # pass probes, then the accumulated match. Isolates what BD-CSPN adds on top of accumulation.
+    accb = accumulated_identification_bdcspn(net, target, ks=ks)
+    print("accumulated rank1 (cross-footwear, FULL gallery + BD-CSPN)  " +
+          "  ".join(f"{k}-step {v:.3f}" for k, v in accb.items()))
     ev.to_parquet(ARTIFACTS / f"eval_{args.model}_{args.split}.parquet", index=False)
     if args.plot_embed:
         p = plot_embeddings(net, target, f"{args.model} {args.split} embeddings",

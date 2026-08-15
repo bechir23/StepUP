@@ -334,7 +334,7 @@ class GaitR21D(nn.Module):
     hooks as GaitCNN: norm='snr' inserts SNR3d after the early stages; mixstyle/dsu perturb per-sample
     feature statistics (5D-aware); hpp does part-based heel->toe pooling after a temporal collapse."""
 
-    def __init__(self, widths=(32, 64, 128, 128), mixstyle=False, dsu=False, hpp=False, norm="snr"):
+    def __init__(self, widths=(64, 128, 256, 256), mixstyle=False, dsu=False, hpp=False, norm="snr"):
         super().__init__()
         c0, c1, c2, c3 = widths
         ms1 = MixStyle() if mixstyle else nn.Identity()

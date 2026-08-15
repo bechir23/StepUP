@@ -244,6 +244,60 @@ def accumulated_identification(net, ds, ks=(1, 3, 5, 10)):
     return {k: float(np.nanmean(v)) for k, v in per_k.items()}
 
 
+def accumulated_identification_bdcspn(net, ds, ks=(1, 3, 5, 10), z=8, scale=10.0):
+    """Live-monitoring variant of accumulated_identification: before the accumulated match,
+    the gallery prototypes are rectified with BD-CSPN using the probe batch (transductive),
+    then each pass window is matched against the rectified prototypes. Combines the two
+    deployment mechanisms -- probe-side accumulation and prototype-side BD-CSPN -- for the
+    continuous-walk setting. Strict leave-one-footwear-out (cross-footwear).
+
+    The gallery here is the FULL reference-footwear prototype -- enroll_templates() averages
+    ALL steps of the enrol footwear per identity -- NOT the k-limited gallery of enroll.py's
+    cross_fw_eval (which builds the prototype from only k enrolled steps). So this measures
+    BD-CSPN on top of the full gallery, while tab:enroll measures it as the gallery grows with k."""
+    f, y, fw = embed_dataset(net, ds)
+    f = F.normalize(f)
+    fw = np.asarray(fw)
+    m = ds.m.reset_index(drop=True)
+    pid = m.ParticipantID.to_numpy(); passid = m.PassID.to_numpy(); stepid = m.FootstepID.to_numpy()
+    per_k = {k: [] for k in ks}
+    for enrol in FOOTWEAR:
+        g = fw == enrol
+        if g.sum() == 0:
+            continue
+        protos, ids = enroll_templates(f[g], y[g])
+        probe_rows = np.where(fw != enrol)[0]
+        if len(probe_rows) == 0:
+            continue
+        # BD-CSPN: shift probes to the prototype centre, then fold confident probes in.
+        q = f[probe_rows]
+        xi = protos.mean(0, keepdim=True) - q.mean(0, keepdim=True)      # cross-class shift
+        q = F.normalize(q + xi, dim=1)
+        conf = torch.softmax((q @ protos.t()) * scale, dim=1)            # pseudo-labels
+        rect = protos.clone()
+        for j in range(len(protos)):
+            w = conf[:, j]
+            top = torch.topk(w, min(z, len(w))).indices
+            ww = w[top].unsqueeze(1)
+            rect[j] = ((protos[j:j + 1] + (ww * q[top]).sum(0, keepdim=True)) / (1.0 + ww.sum())).squeeze(0)
+        rect = F.normalize(rect, dim=1)
+        qrow = {int(r): q[i] for i, r in enumerate(probe_rows)}          # shifted probe by row
+        passes = {}
+        for i in probe_rows:
+            passes.setdefault((pid[i], fw[i], passid[i]), []).append(int(i))
+        for k in ks:
+            hit = tot = 0
+            for _, rows in passes.items():
+                rows = sorted(rows, key=lambda i: stepid[i])
+                for s in range(0, len(rows) - k + 1, k):
+                    win = rows[s:s + k]
+                    probe = F.normalize(torch.stack([qrow[r] for r in win]).mean(0), dim=0)
+                    pred = ids[(probe @ rect.t()).argmax()]
+                    hit += int(pred.item() == int(y[win[0]])); tot += 1
+            per_k[k].append(hit / tot if tot else float("nan"))
+    return {k: float(np.nanmean(v)) for k, v in per_k.items()}
+
+
 def open_set_accumulated(net, ds, n_enroll=5, ks=(1, 3, 5, 10), repeats=3, precomp=None,
                          score_norm="none"):
     """Reference open-set protocol (mixed-footwear gallery, NOT cross-footwear): enroll
